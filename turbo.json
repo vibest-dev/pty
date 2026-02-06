@@ -1,0 +1,23 @@
+{
+  "$schema": "https://turborepo.dev/schema.v2.json",
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**", "public/dist/**"]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "test": {
+      "dependsOn": ["^build"]
+    },
+    "test:sdk": {
+      "dependsOn": ["^build"]
+    },
+    "test:e2e": {
+      "dependsOn": ["^build", "vibest-pty-daemon#build"],
+      "cache": false
+    }
+  }
+}

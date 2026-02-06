@@ -1,0 +1,16 @@
+{
+  "name": "@vibest/pty-daemon-playground",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun run server.ts",
+    "build": "bun build public/main.ts --outdir public/dist"
+  },
+  "dependencies": {
+    "@msgpack/msgpack": "^3.0.0",
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/addon-unicode11": "^0.9.0",
+    "@xterm/addon-webgl": "^0.19.0",
+    "@xterm/xterm": "^5.5.0"
+  }
+}

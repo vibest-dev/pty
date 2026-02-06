@@ -78,14 +78,14 @@ Path overrides:
 
 - postinstall determines platform (darwin arm64/x64)
 - it resolves the installed platform package from optionalDependencies
-- it links or copies the binary into main package bin/pty-daemon
+- it links or copies the binary into main package `bin/vibest-pty-daemon`
 - it respects PTY_DAEMON_PATH if provided at runtime
 
 ## Build and Publish
 
 - scripts/build.ts (Bun, TypeScript):
   - builds rust targets for darwin-arm64 and darwin-x64
-  - emits dist/@vibest/pty-daemon-<platform>/bin/pty-daemon
+  - emits `dist/@vibest/pty-daemon-<platform>/bin/vibest-pty-daemon`
   - writes per-platform package.json with os/cpu fields
 - scripts/publish.ts (Bun, TypeScript):
   - runs build

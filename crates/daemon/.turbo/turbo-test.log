@@ -1,0 +1,131 @@
+
+[0m[2m[35m$[0m [2m[1mcargo test -p vibest-pty-daemon[0m
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+[1m[92m     Running[0m unittests src/main.rs (/Users/dinq/Code/iamdin/bun-build/rust-daemon/target/debug/deps/vibest_pty_daemon-5580f44088aab4eb)
+
+running 0 tests
+
+test result: [32mok[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests/integration_test.rs (/Users/dinq/Code/iamdin/bun-build/rust-daemon/target/debug/deps/integration_test-e868ef7c2abd74d8)
+
+running 12 tests
+test unit_tests::test_response_deserialization ... [32mok[m
+test unit_tests::test_request_serialization ... [32mok[m
+[daemon] Rust PTY Daemon v0.2.0 starting...
+[auth] Generated new token at /tmp/rust-pty-test-0.token
+[daemon] Listening on /tmp/rust-pty-test-0.sock
+[daemon] PID: 2617
+[daemon] Rust PTY Daemon v0.2.0 starting...
+[auth] Generated new token at /tmp/rust-pty-test-5.token
+[daemon] Listening on /tmp/rust-pty-test-5.sock
+[daemon] PID: 2611
+[daemon] Rust PTY Daemon v0.2.0 starting...
+[auth] Generated new token at /tmp/rust-pty-test-9.token
+[daemon] Listening on /tmp/rust-pty-test-9.sock
+[daemon] PID: 2618
+[daemon] Rust PTY Daemon v0.2.0 starting...
+[auth] Generated new token at /tmp/rust-pty-test-3.token
+[daemon] Listening on /tmp/rust-pty-test-3.sock
+[daemon] PID: 2613
+[daemon] Rust PTY Daemon v0.2.0 starting...
+[daemon] Rust PTY Daemon v0.2.0 starting...
+[daemon] Rust PTY Daemon v0.2.0 starting...
+[daemon] Rust PTY Daemon v0.2.0 starting...
+[auth] Generated new token at [auth] Generated new token at [daemon] Rust PTY Daemon v0.2.0 starting...
+[auth] Generated new token at /tmp/rust-pty-test-1.token/tmp/rust-pty-test-2.token/tmp/rust-pty-test-7.token
+
+
+[auth] Generated new token at /tmp/rust-pty-test-8.token[auth] Generated new token at 
+/tmp/rust-pty-test-6.token
+[daemon] Rust PTY Daemon v0.2.0 starting...
+[daemon] Listening on /tmp/rust-pty-test-7.sock[auth] Generated new token at /tmp/rust-pty-test-4.token[daemon] Listening on 
+
+/tmp/rust-pty-test-2.sock[daemon] Listening on 
+[daemon] PID: /tmp/rust-pty-test-1.sock[daemon] PID: 26162619
+
+[daemon] PID: 
+2615
+[daemon] Listening on /tmp/rust-pty-test-6.sock
+[daemon] PID: 2620
+[daemon] Listening on /tmp/rust-pty-test-8.sock
+[daemon] PID: 2612
+[daemon] Listening on /tmp/rust-pty-test-4.sock
+[daemon] PID: 2614
+[handler] Received request: Handshake { token: "UY0H0K3cTHShJKuNqDE0hw4ZII9h8ZiWFa7JslyXmQ8qgcEowl0RqajltlfXAVmU", protocol_version: 1 }
+[handler] Received request: Handshake { token: "BCew56Yq6qCS17T5CpH4tvTo7H1sIVpyxdeRNEVmY5qP5QZUck8K3I961Pr3FGz2", protocol_version: 1 }
+[handler] Handshake: protocol_version=1, token_len=64
+[handler] Handshake: protocol_version=1, token_len=64
+[handler] Auth succeeded
+[handler] Auth succeeded
+[handler] Received request: Create { options: CreateOptions { cwd: None, cols: Some(80), rows: Some(24), env: None, shell: None, initial_commands: None } }
+[handler] Received request: List
+[handler] Received request: Kill { session: 1 }
+[handler] Received request: Handshake { token: "ey4j1a5KKJoNsdPx51xOWtUw1HE09EtxlQ4lOkobMQSbgsqpp2YXZLv4IB5LZB0M", protocol_version: 1 }
+[handler] Handshake: protocol_version=1, token_len=64
+test integration_tests::test_seq_roundtrip ... [handler] Auth succeeded
+[handler] Received request: Handshake { token: "ey4j1a5KKJoNsdPx51xOWtUw1HE09EtxlQ4lOkobMQSbgsqpp2YXZLv4IB5LZB0M", protocol_version: 1 }
+[32mok[m[handler] Handshake: protocol_version=1, token_len=64
+
+[handler] Auth succeeded
+[handler] Received request: Handshake { token: "ey4j1a5KKJoNsdPx51xOWtUw1HE09EtxlQ4lOkobMQSbgsqpp2YXZLv4IB5LZB0M", protocol_version: 1 }
+[handler] Handshake: protocol_version=1, token_len=64
+[handler] Received request: Handshake { token: "ey4j1a5KKJoNsdPx51xOWtUw1HE09EtxlQ4lOkobMQSbgsqpp2YXZLv4IB5LZB0M", protocol_version: 1 }
+[handler] Handshake: protocol_version=1, token_len=64
+[handler] Auth succeeded
+[handler] Received request: Handshake { token: "ey4j1a5KKJoNsdPx51xOWtUw1HE09EtxlQ4lOkobMQSbgsqpp2YXZLv4IB5LZB0M", protocol_version: 1 }
+[handler] Handshake: protocol_version=1, token_len=64
+[handler] Auth succeeded
+[handler] Auth succeeded
+[handler] Received request: Create { options: CreateOptions { cwd: None, cols: Some(80), rows: Some(24), env: None, shell: None, initial_commands: None } }
+[handler] Received request: Handshake { token: "invalid_token", protocol_version: 1 }
+[handler] Handshake: protocol_version=1, token_len=13
+[handler] Received request: Create { options: CreateOptions { cwd: None, cols: Some(80), rows: Some(24), env: None, shell: None, initial_commands: None } }
+[handler] Auth failed for token
+[handler] Received request: Create { options: CreateOptions { cwd: None, cols: Some(80), rows: Some(24), env: None, shell: None, initial_commands: None } }
+[handler] Received request: Create { options: CreateOptions { cwd: None, cols: Some(80), rows: Some(24), env: None, shell: None, initial_commands: None } }
+[handler] Received request: Create { options: CreateOptions { cwd: None, cols: Some(80), rows: Some(24), env: None, shell: None, initial_commands: None } }
+test integration_tests::test_invalid_token ... [32mok[m
+[handler] Received request: Handshake { token: "ey4j1a5KKJoNsdPx51xOWtUw1HE09EtxlQ4lOkobMQSbgsqpp2YXZLv4IB5LZB0M", protocol_version: 1 }
+[handler] Handshake: protocol_version=1, token_len=64
+[handler] Auth succeeded
+[handler] Received request: List
+test integration_tests::test_concurrent_clients ... [32mok[m
+[handler] Received request: Handshake { token: "TFQQ2Bmdy8mlZilShpRzpBjCTzF23pCvBT9f4520XuSEVfkDFfoFOXC8PUJ9e6SX", protocol_version: 1 }
+[handler] Handshake: protocol_version=1, token_len=64
+[handler] Auth succeeded
+[handler] Received request: Create { options: CreateOptions { cwd: None, cols: Some(80), rows: Some(24), env: None, shell: None, initial_commands: None } }
+[handler] Received request: Create { options: CreateOptions { cwd: None, cols: Some(80), rows: Some(24), env: None, shell: None, initial_commands: None } }
+[handler] Received request: Create { options: CreateOptions { cwd: None, cols: Some(80), rows: Some(24), env: None, shell: None, initial_commands: None } }
+[handler] Received request: KillAll
+[handler] Received request: Handshake { token: "KJWRnmpEwO0Rr1ptrKyUEeZlrHoQNSyDYppq0MCnFqntqBw6zoPtrScriUJQvR4C", protocol_version: 1 }
+[handler] Handshake: protocol_version=1, token_len=64
+[handler] Auth succeeded
+[handler] Received request: Create { options: CreateOptions { cwd: Some("/tmp"), cols: Some(80), rows: Some(24), env: None, shell: None, initial_commands: None } }
+test integration_tests::test_create_session ... [32mok[m
+[handler] Received request: Handshake { token: "iKIbclZbwytnRd9SZ1ej0cHJb5mpmZwnzuXTRuMwJciBTYP9lequ3goEvLgsX6iS", protocol_version: 1 }
+[handler] Handshake: protocol_version=1, token_len=64
+[handler] Auth succeeded
+[handler] Received request: Create { options: CreateOptions { cwd: None, cols: Some(80), rows: Some(24), env: None, shell: None, initial_commands: None } }
+[handler] Received request: Handshake { token: "FFhmsSN6CoCXiQjEehG3QvLAYf5nwQ2uPnxfuLdbljdz8MD1IdnBEXVtK1X52vE9", protocol_version: 1 }
+[handler] Handshake: protocol_version=1, token_len=64
+[handler] Auth succeeded
+[handler] Received request: Handshake { token: "RZd172NcGLlwELYMjwZ632LaprOhmH3wPqpL6sFLQlsTObh9f4FTlg3aXKVg0Ey4", protocol_version: 999 }
+[handler] Handshake: protocol_version=999, token_len=64
+[handler] Received request: Handshake { token: "p2H7furpmGNwSjD2hLV0yRoj297bZYcxXMHTrVq3RqjdMbBWJoexoolePVze7jqj", protocol_version: 1 }
+[handler] Handshake: protocol_version=1, token_len=64
+[handler] Auth succeeded
+[handler] Received request: Create { options: CreateOptions { cwd: None, cols: Some(80), rows: Some(24), env: None, shell: None, initial_commands: None } }
+[handler] Received request: Signal { session: 1, signal: "SIGINT" }
+test integration_tests::test_handshake_authentication ... [32mok[m
+test integration_tests::test_protocol_version_mismatch ... [32mok[m
+test integration_tests::test_signal_session ... [32mok[m
+[handler] Received request: List
+test integration_tests::test_list_sessions ... [32mok[m
+[handler] Received request: List
+test integration_tests::test_kill_session ... [32mok[m
+[handler] Received request: List
+test integration_tests::test_kill_all ... [32mok[m
+
+test result: [32mok[m. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.17s
+

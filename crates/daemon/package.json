@@ -1,0 +1,9 @@
+{
+  "name": "vibest-pty-daemon",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "cargo build --release -p vibest-pty-daemon",
+    "test": "cargo test -p vibest-pty-daemon"
+  }
+}

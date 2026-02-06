@@ -1,0 +1,17 @@
+{
+  "name": "@vibest/pty-daemon-e2e",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun run test:daemon && bun run test:sdk",
+    "test:e2e": "bun run test",
+    "test:daemon": "bun test e2e.test.ts",
+    "test:sdk": "bunx vitest --run layout.test.ts postinstall.test.ts"
+  },
+  "dependencies": {
+    "@vibest/pty-daemon": "workspace:*"
+  },
+  "devDependencies": {
+    "vitest": "^4.0.18"
+  }
+}

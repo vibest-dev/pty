@@ -1,0 +1,580 @@
+//! Integration tests for the PTY daemon
+//!
+//! Each test spawns its own daemon instance with unique socket paths
+
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
+use std::process::{Child, Command};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
+use std::{fs, thread};
+
+use rmp_serde::{from_slice, to_vec_named};
+use serde::{Deserialize, Serialize};
+
+// Unique counter for test isolation
+static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+fn get_test_paths() -> (String, String) {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let socket = format!("/tmp/rust-pty-test-{}.sock", id);
+    let token = format!("/tmp/rust-pty-test-{}.token", id);
+    (socket, token)
+}
+
+const PROTOCOL_VERSION: u32 = 1;
+
+// ============== Message Types ==============
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Request {
+    Handshake {
+        token: String,
+        protocol_version: u32,
+    },
+    Create {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cols: Option<u16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rows: Option<u16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        initial_commands: Option<Vec<String>>,
+    },
+    List,
+    Attach {
+        session: u32,
+    },
+    Detach {
+        session: u32,
+    },
+    Kill {
+        session: u32,
+    },
+    KillAll,
+    Resize {
+        session: u32,
+        cols: u16,
+        rows: u16,
+    },
+    Signal {
+        session: u32,
+        signal: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RequestEnvelope {
+    seq: u32,
+    #[serde(flatten)]
+    request: Request,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Response {
+    Handshake {
+        protocol_version: u32,
+        daemon_version: String,
+        daemon_pid: u32,
+    },
+    Ok {
+        seq: u32,
+        session: Option<u32>,
+        sessions: Option<Vec<SessionInfo>>,
+    },
+    Error {
+        seq: u32,
+        code: String,
+        message: String,
+    },
+    #[allow(dead_code)]
+    Output {
+        session: u32,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+    },
+    #[allow(dead_code)]
+    Exit {
+        session: u32,
+        code: i32,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionInfo {
+    id: u32,
+    #[allow(dead_code)]
+    pid: i32,
+    #[allow(dead_code)]
+    pts: String,
+    is_alive: bool,
+}
+
+// ============== Test Helpers ==============
+
+struct TestDaemon {
+    child: Child,
+    socket_path: String,
+    token_path: String,
+}
+
+impl TestDaemon {
+    fn start() -> Self {
+        let (socket_path, token_path) = get_test_paths();
+
+        // Cleanup
+        let _ = fs::remove_file(&socket_path);
+        let _ = fs::remove_file(&token_path);
+
+        let child = Command::new(env!("CARGO_BIN_EXE_vibest-pty-daemon"))
+            .env("RUST_PTY_SOCKET_PATH", &socket_path)
+            .env("RUST_PTY_TOKEN_PATH", &token_path)
+            .spawn()
+            .expect("Failed to start daemon");
+
+        // Wait for socket
+        for _ in 0..50 {
+            if fs::metadata(&socket_path).is_ok() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        thread::sleep(Duration::from_millis(200));
+
+        Self {
+            child,
+            socket_path,
+            token_path,
+        }
+    }
+
+    fn client(&self) -> TestClient {
+        TestClient::connect(&self.socket_path, &self.token_path)
+    }
+}
+
+impl Drop for TestDaemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = fs::remove_file(&self.socket_path);
+        let _ = fs::remove_file(&self.token_path);
+        let _ = fs::remove_file(format!(
+            "{}.pid",
+            self.socket_path.trim_end_matches(".sock")
+        ));
+    }
+}
+
+struct TestClient {
+    stream: UnixStream,
+    token_path: String,
+    next_seq: u32,
+}
+
+impl TestClient {
+    fn connect(socket_path: &str, token_path: &str) -> Self {
+        let stream = UnixStream::connect(socket_path).expect("Failed to connect");
+        // Set blocking mode and longer timeout
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        Self {
+            stream,
+            token_path: token_path.to_string(),
+            next_seq: 1,
+        }
+    }
+
+    fn send(&mut self, req: &Request) -> u32 {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.send_with_seq(req, seq)
+    }
+
+    fn send_with_seq(&mut self, req: &Request, seq: u32) -> u32 {
+        let payload = to_vec_named(&RequestEnvelope {
+            seq,
+            request: req.clone(),
+        })
+        .unwrap();
+        let len = (payload.len() as u32).to_be_bytes();
+        self.stream.write_all(&len).unwrap();
+        self.stream.write_all(&payload).unwrap();
+        self.stream.flush().unwrap();
+        seq
+    }
+
+    fn recv(&mut self) -> Response {
+        let mut len_buf = [0u8; 4];
+        self.stream.read_exact(&mut len_buf).unwrap();
+        let len = u32::from_be_bytes(len_buf) as usize;
+
+        let mut payload = vec![0u8; len];
+        self.stream.read_exact(&mut payload).unwrap();
+
+        from_slice(&payload).unwrap()
+    }
+
+    fn authenticate(&mut self) {
+        let token = fs::read_to_string(&self.token_path)
+            .expect("Cannot read token")
+            .trim()
+            .to_string();
+
+        self.send(&Request::Handshake {
+            token,
+            protocol_version: PROTOCOL_VERSION,
+        });
+
+        match self.recv() {
+            Response::Handshake { .. } => {}
+            resp => panic!("Expected Handshake response, got {:?}", resp),
+        }
+    }
+}
+
+// ============== Unit Tests ==============
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    #[test]
+    fn test_request_serialization() {
+        let req = Request::Create {
+            cwd: Some("/tmp".into()),
+            cols: Some(80),
+            rows: Some(24),
+            initial_commands: None,
+        };
+
+        let bytes = to_vec_named(&req).unwrap();
+        let decoded: Request = from_slice(&bytes).unwrap();
+
+        match decoded {
+            Request::Create { cwd, cols, .. } => {
+                assert_eq!(cwd, Some("/tmp".into()));
+                assert_eq!(cols, Some(80));
+            }
+            _ => panic!("Wrong type"),
+        }
+    }
+
+    #[test]
+    fn test_response_deserialization() {
+        let resp = Response::Ok {
+            seq: 1,
+            session: Some(1),
+            sessions: None,
+        };
+
+        let bytes = to_vec_named(&resp).unwrap();
+        let decoded: Response = from_slice(&bytes).unwrap();
+
+        match decoded {
+            Response::Ok { session, .. } => assert_eq!(session, Some(1)),
+            _ => panic!("Wrong type"),
+        }
+    }
+}
+
+// ============== Integration Tests ==============
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+
+    #[test]
+    fn test_handshake_authentication() {
+        let daemon = TestDaemon::start();
+        let mut client = daemon.client();
+
+        let token = fs::read_to_string(&daemon.token_path)
+            .unwrap()
+            .trim()
+            .to_string();
+        client.send(&Request::Handshake {
+            token,
+            protocol_version: PROTOCOL_VERSION,
+        });
+
+        match client.recv() {
+            Response::Handshake {
+                protocol_version,
+                daemon_version,
+                ..
+            } => {
+                assert_eq!(protocol_version, PROTOCOL_VERSION);
+                assert!(!daemon_version.is_empty());
+            }
+            resp => panic!("Expected Handshake, got {:?}", resp),
+        }
+    }
+
+    #[test]
+    fn test_invalid_token() {
+        let daemon = TestDaemon::start();
+        let mut client = daemon.client();
+
+        client.send(&Request::Handshake {
+            token: "invalid_token".into(),
+            protocol_version: PROTOCOL_VERSION,
+        });
+
+        match client.recv() {
+            Response::Error { code, .. } => {
+                assert_eq!(code, "AUTH_FAILED");
+            }
+            resp => panic!("Expected Error, got {:?}", resp),
+        }
+    }
+
+    #[test]
+    fn test_protocol_version_mismatch() {
+        let daemon = TestDaemon::start();
+        let mut client = daemon.client();
+
+        let token = fs::read_to_string(&daemon.token_path)
+            .unwrap()
+            .trim()
+            .to_string();
+        client.send(&Request::Handshake {
+            token,
+            protocol_version: 999,
+        });
+
+        match client.recv() {
+            Response::Error { code, .. } => {
+                assert_eq!(code, "PROTOCOL_MISMATCH");
+            }
+            resp => panic!("Expected Error, got {:?}", resp),
+        }
+    }
+
+    #[test]
+    fn test_create_session() {
+        let daemon = TestDaemon::start();
+        let mut client = daemon.client();
+        client.authenticate();
+
+        client.send(&Request::Create {
+            cwd: Some("/tmp".into()),
+            cols: Some(80),
+            rows: Some(24),
+            initial_commands: None,
+        });
+
+        match client.recv() {
+            Response::Ok { session, .. } => {
+                assert!(session.is_some());
+                let id = session.unwrap();
+                assert!(id > 0);
+            }
+            resp => panic!("Expected Ok, got {:?}", resp),
+        }
+    }
+
+    #[test]
+    fn test_list_sessions() {
+        let daemon = TestDaemon::start();
+        let mut client = daemon.client();
+        client.authenticate();
+
+        // Create a session
+        client.send(&Request::Create {
+            cwd: None,
+            cols: Some(80),
+            rows: Some(24),
+            initial_commands: None,
+        });
+        let _ = client.recv();
+
+        // List sessions
+        client.send(&Request::List);
+
+        match client.recv() {
+            Response::Ok { sessions, .. } => {
+                assert!(sessions.is_some());
+                let list = sessions.unwrap();
+                assert_eq!(list.len(), 1);
+                assert!(list[0].is_alive);
+            }
+            resp => panic!("Expected Ok, got {:?}", resp),
+        }
+    }
+
+    #[test]
+    fn test_seq_roundtrip() {
+        let daemon = TestDaemon::start();
+        let mut client = daemon.client();
+        client.authenticate();
+
+        let sent_seq = client.send(&Request::List);
+        match client.recv() {
+            Response::Ok { seq, .. } => assert_eq!(seq, sent_seq),
+            resp => panic!("Expected Ok, got {:?}", resp),
+        }
+    }
+
+    #[test]
+    fn test_kill_session() {
+        let daemon = TestDaemon::start();
+        let mut client = daemon.client();
+        client.authenticate();
+
+        // Create
+        client.send(&Request::Create {
+            cwd: None,
+            cols: Some(80),
+            rows: Some(24),
+            initial_commands: None,
+        });
+        let session_id = match client.recv() {
+            Response::Ok { session, .. } => session.unwrap(),
+            _ => panic!("Create failed"),
+        };
+
+        // Kill
+        client.send(&Request::Kill {
+            session: session_id,
+        });
+
+        match client.recv() {
+            Response::Ok { session, .. } => {
+                assert_eq!(session, Some(session_id));
+            }
+            resp => panic!("Expected Ok, got {:?}", resp),
+        }
+
+        // Verify empty
+        client.send(&Request::List);
+        match client.recv() {
+            Response::Ok { sessions, .. } => {
+                assert!(sessions.unwrap().is_empty());
+            }
+            _ => panic!("List failed"),
+        }
+    }
+
+    #[test]
+    fn test_signal_session() {
+        let daemon = TestDaemon::start();
+        let mut client = daemon.client();
+        client.authenticate();
+
+        // Create
+        client.send(&Request::Create {
+            cwd: None,
+            cols: Some(80),
+            rows: Some(24),
+            initial_commands: None,
+        });
+        let session_id = match client.recv() {
+            Response::Ok { session, .. } => session.unwrap(),
+            _ => panic!("Create failed"),
+        };
+
+        // Signal
+        client.send(&Request::Signal {
+            session: session_id,
+            signal: "SIGINT".into(),
+        });
+
+        match client.recv() {
+            Response::Ok { session, .. } => {
+                assert_eq!(session, Some(session_id));
+            }
+            resp => panic!("Expected Ok, got {:?}", resp),
+        }
+    }
+
+    #[test]
+    fn test_kill_all() {
+        let daemon = TestDaemon::start();
+        let mut client = daemon.client();
+        client.authenticate();
+
+        // Create multiple sessions
+        for _ in 0..3 {
+            client.send(&Request::Create {
+                cwd: None,
+                cols: Some(80),
+                rows: Some(24),
+                initial_commands: None,
+            });
+            let _ = client.recv();
+        }
+
+        // Kill all
+        client.send(&Request::KillAll);
+        match client.recv() {
+            Response::Ok { session, .. } => {
+                assert_eq!(session, Some(3)); // Killed 3
+            }
+            _ => panic!("Kill all failed"),
+        }
+
+        // Verify empty
+        client.send(&Request::List);
+        match client.recv() {
+            Response::Ok { sessions, .. } => {
+                assert!(sessions.unwrap().is_empty());
+            }
+            _ => panic!("List failed"),
+        }
+    }
+
+    #[test]
+    fn test_concurrent_clients() {
+        let daemon = TestDaemon::start();
+
+        let socket_path = daemon.socket_path.clone();
+        let token_path = daemon.token_path.clone();
+
+        let handles: Vec<_> = (0..5)
+            .map(|i| {
+                let sp = socket_path.clone();
+                let tp = token_path.clone();
+                thread::spawn(move || {
+                    let mut client = TestClient::connect(&sp, &tp);
+                    client.authenticate();
+
+                    // Create session
+                    client.send(&Request::Create {
+                        cwd: None,
+                        cols: Some(80),
+                        rows: Some(24),
+                        initial_commands: None,
+                    });
+
+                    match client.recv() {
+                        Response::Ok { session, .. } => session.unwrap(),
+                        _ => panic!("Create failed in thread {}", i),
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Verify all created
+        let mut client = daemon.client();
+        client.authenticate();
+        client.send(&Request::List);
+
+        match client.recv() {
+            Response::Ok { sessions, .. } => {
+                assert_eq!(sessions.unwrap().len(), 5);
+            }
+            _ => panic!("List failed"),
+        }
+    }
+}
