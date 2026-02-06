@@ -19,6 +19,19 @@ Status: Draft (validated)
 - Bundling with Electron app resources.
 - Backward compatibility with existing external users.
 
+## Repository Layout (Bun Workspaces)
+
+- `crates/daemon/`: Rust daemon crate (Cargo.toml + src)
+- `packages/pty-daemon/`: TS SDK (tsdown build, ESM + CJS + types)
+- `scripts/`: build/publish/postinstall (TypeScript, executed with Bun)
+- `dist/`: publish artifacts (ignored)
+
+Root `package.json` uses `workspaces: ["packages/*"]` and exposes orchestration scripts:
+
+- `build:rust`: `cargo build --release --manifest-path crates/daemon/Cargo.toml`
+- `build:sdk`: `bun run -C packages/pty-daemon build`
+- `build:packages`: build platform subpackages and main package
+
 ## Architecture Overview
 
 - Rust daemon remains a standalone binary (Unix socket, MsgPack framing).
@@ -70,15 +83,15 @@ Path overrides:
 
 ## Build and Publish
 
-- scripts/build.ts:
+- scripts/build.ts (Bun, TypeScript):
   - builds rust targets for darwin-arm64 and darwin-x64
   - emits dist/@vibest/pty-daemon-<platform>/bin/pty-daemon
   - writes per-platform package.json with os/cpu fields
-- scripts/publish.ts:
+- scripts/publish.ts (Bun, TypeScript):
   - runs build
   - assembles main package (postinstall + SDK build)
   - publishes platform packages then main package
-- scripts/postinstall.mjs:
+- scripts/postinstall.mjs (generated from TS or kept as .mjs):
   - chooses correct platform package
   - links/copies binary into main package bin directory
 
@@ -90,14 +103,19 @@ Path overrides:
 
 ## Testing
 
-- Node e2e script:
-  - spawn daemon
-  - connect + hello
-  - create session
-  - list sessions
-  - kill session
-  - shutdown
-- Protocol unit test for seq correlation.
+All JS/TS tests use Vitest. Rust tests remain `cargo test`.
+
+- Unit (Vitest):
+  - SDK framing (length-prefix), MsgPack encode/decode
+  - seq correlation and pending map behavior
+  - path resolution and env overrides (PTY_DAEMON_PATH, socket/token paths)
+- Integration (Vitest):
+  - spawn daemon (using PTY_DAEMON_PATH)
+  - hello → create → list → attach/detach → kill
+  - verify seq mapping and output/exit events
+- E2E (Vitest + scripts):
+  - run scripts/build.ts to generate dist/
+  - run postinstall against dist/ and assert bin linkage
 
 ## Open Questions
 
