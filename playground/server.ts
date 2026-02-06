@@ -1,68 +1,35 @@
-import { encode, decode } from "@msgpack/msgpack";
+import {
+  createPtyClient,
+  type PtyDaemonClient,
+  type SessionInfo,
+} from "@vibest/pty-daemon";
 import { existsSync, mkdirSync, unlinkSync } from "fs";
 import { readFile, writeFile } from "fs/promises";
-import { join } from "path";
+import { dirname, join, resolve } from "path";
+import { fileURLToPath } from "url";
 
-const SOCKET_PATH = "/tmp/rust-pty.sock";
-const TOKEN_PATH = "/tmp/rust-pty.token";
+const SOCKET_PATH = process.env.RUST_PTY_SOCKET_PATH || "/tmp/rust-pty.sock";
+const TOKEN_PATH = process.env.RUST_PTY_TOKEN_PATH || "/tmp/rust-pty.token";
 const PROTOCOL_VERSION = 1;
-const PORT = 3000;
+const PORT = Number(process.env.PORT || 3000);
 const HISTORY_DIR = process.env.RUST_PTY_HISTORY_DIR || "/tmp/.vibest/pty-history";
 const MAX_HISTORY_BYTES = 5 * 1024 * 1024;
 const MAX_ATTACH_HISTORY_BYTES = 512 * 1024;
 const HISTORY_FLUSH_INTERVAL_MS = 200;
 const CLEAR_SCROLLBACK_SEQUENCE = Buffer.from([0x1b, 0x5b, 0x33, 0x4a]);
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const LOCAL_DAEMON_BINARY = join(REPO_ROOT, "target", "release", "vibest-pty-daemon");
+const AUTO_START_DAEMON = process.env.PTY_DAEMON_AUTOSTART !== "0";
 
 mkdirSync(HISTORY_DIR, { recursive: true, mode: 0o700 });
-
-// ============== Types ==============
-
-interface SessionInfo {
-  id: number;
-  pid: number;
-  pts: string;
-  is_alive: boolean;
-  created_at: string;
-  last_attached_at: string;
-  workspace_id?: string;
-  pane_id?: string;
-}
-
-interface Snapshot {
-  content: string;
-  rehydrate: string;
-  cols: number;
-  rows: number;
-  cursor_x: number;
-  cursor_y: number;
-  modes: Record<string, boolean>;
-  cwd?: string;
-}
-
-type DaemonMessage =
-  | { type: "hello"; token: string; protocol_version: number }
-  | { type: "hello"; protocol_version: number; daemon_version: string; daemon_pid: number }
-  | { type: "create" }
-  | { type: "list" }
-  | { type: "attach"; session: number }
-  | { type: "detach"; session: number }
-  | { type: "kill"; session: number }
-  | { type: "input"; session: number; data: Uint8Array }
-  | { type: "resize"; session: number; cols: number; rows: number }
-  | { type: "output"; session: number; data: Uint8Array }
-  | { type: "exit"; session: number; code: number }
-  | { type: "ok"; seq?: number; session?: number; sessions?: SessionInfo[]; snapshot?: Snapshot; data?: any }
-  | { type: "error"; seq?: number; code?: string; message: string };
 
 type WebSocketMessage =
   | { type: "create" }
   | { type: "list" }
   | { type: "attach"; session: number }
   | { type: "kill"; session: number }
-  | { type: "input"; session: number; data: string } // base64
+  | { type: "input"; session: number; data: string }
   | { type: "resize"; session: number; cols: number; rows: number };
-
-// ============== History Persistence ==============
 
 interface HistoryState {
   buffer: Buffer;
@@ -74,6 +41,18 @@ interface HistoryState {
 }
 
 const historyStates = new Map<number, HistoryState>();
+
+function resolveDaemonBinaryPath(): string | undefined {
+  if (process.env.PTY_DAEMON_PATH) {
+    return process.env.PTY_DAEMON_PATH;
+  }
+
+  if (existsSync(LOCAL_DAEMON_BINARY)) {
+    return LOCAL_DAEMON_BINARY;
+  }
+
+  return undefined;
+}
 
 function historyFilePath(sessionId: number): string {
   return join(HISTORY_DIR, `session-${sessionId}.bin`);
@@ -87,14 +66,19 @@ function dropLeadingUtf8Continuation(buffer: Buffer): Buffer {
   let start = 0;
   while (start < buffer.length) {
     const byte = buffer[start];
-    if ((byte & 0b1100_0000) !== 0b1000_0000) break;
+    if ((byte & 0b1100_0000) !== 0b1000_0000) {
+      break;
+    }
     start++;
   }
   return start === 0 ? buffer : buffer.slice(start);
 }
 
 function findLastSequence(buffer: Buffer, sequence: Buffer): number {
-  if (buffer.length < sequence.length) return -1;
+  if (buffer.length < sequence.length) {
+    return -1;
+  }
+
   for (let i = buffer.length - sequence.length; i >= 0; i--) {
     let matched = true;
     for (let j = 0; j < sequence.length; j++) {
@@ -103,14 +87,21 @@ function findLastSequence(buffer: Buffer, sequence: Buffer): number {
         break;
       }
     }
-    if (matched) return i;
+
+    if (matched) {
+      return i;
+    }
   }
+
   return -1;
 }
 
 function getHistoryState(sessionId: number): HistoryState {
   const existing = historyStates.get(sessionId);
-  if (existing) return existing;
+  if (existing) {
+    return existing;
+  }
+
   const now = Date.now();
   const state: HistoryState = {
     buffer: Buffer.alloc(0),
@@ -120,12 +111,16 @@ function getHistoryState(sessionId: number): HistoryState {
     createdAt: now,
     lastUpdatedAt: now,
   };
+
   historyStates.set(sessionId, state);
   return state;
 }
 
 function scheduleHistoryFlush(sessionId: number, state: HistoryState): void {
-  if (state.flushTimer) return;
+  if (state.flushTimer) {
+    return;
+  }
+
   state.flushTimer = setTimeout(() => {
     state.flushTimer = null;
     void flushHistory(sessionId);
@@ -134,14 +129,18 @@ function scheduleHistoryFlush(sessionId: number, state: HistoryState): void {
 
 async function flushHistory(sessionId: number): Promise<void> {
   const state = historyStates.get(sessionId);
-  if (!state) return;
+  if (!state) {
+    return;
+  }
+
   if (state.flushing) {
     state.pendingFlush = true;
     return;
   }
-  state.flushing = true;
 
+  state.flushing = true;
   const buffer = state.buffer;
+
   try {
     await writeFile(historyFilePath(sessionId), buffer);
     await writeFile(
@@ -151,10 +150,11 @@ async function flushHistory(sessionId: number): Promise<void> {
         createdAt: new Date(state.createdAt).toISOString(),
         updatedAt: new Date(state.lastUpdatedAt).toISOString(),
         size: buffer.length,
-      })
+      }),
     );
-  } catch (e: any) {
-    console.error(`[history] Failed to flush session ${sessionId}:`, e?.message || e);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[history] Failed to flush session ${sessionId}: ${message}`);
   } finally {
     state.flushing = false;
   }
@@ -166,7 +166,10 @@ async function flushHistory(sessionId: number): Promise<void> {
 }
 
 function appendHistory(sessionId: number, data: Uint8Array): void {
-  if (data.length === 0) return;
+  if (data.length === 0) {
+    return;
+  }
+
   const state = getHistoryState(sessionId);
   let chunk = Buffer.from(data);
 
@@ -176,7 +179,9 @@ function appendHistory(sessionId: number, data: Uint8Array): void {
     state.buffer = Buffer.alloc(0);
   }
 
-  if (chunk.length === 0) return;
+  if (chunk.length === 0) {
+    return;
+  }
 
   const combined = Buffer.concat([state.buffer, chunk], state.buffer.length + chunk.length);
   if (combined.length > MAX_HISTORY_BYTES) {
@@ -193,11 +198,15 @@ function appendHistory(sessionId: number, data: Uint8Array): void {
 async function readHistoryTail(sessionId: number): Promise<Buffer | null> {
   try {
     const data = await readFile(historyFilePath(sessionId));
-    if (!data.length) return null;
+    if (!data.length) {
+      return null;
+    }
+
     let tail = data;
     if (data.length > MAX_ATTACH_HISTORY_BYTES) {
       tail = data.slice(data.length - MAX_ATTACH_HISTORY_BYTES);
     }
+
     tail = dropLeadingUtf8Continuation(tail);
     return tail.length > 0 ? tail : null;
   } catch {
@@ -216,8 +225,8 @@ function clearHistory(sessionId: number): void {
   if (existsSync(binPath)) {
     try {
       unlinkSync(binPath);
-    } catch (e) {
-      console.warn(`[history] Failed to remove ${binPath}:`, e);
+    } catch (error) {
+      console.warn(`[history] Failed to remove ${binPath}:`, error);
     }
   }
 
@@ -225,191 +234,10 @@ function clearHistory(sessionId: number): void {
   if (existsSync(metaPath)) {
     try {
       unlinkSync(metaPath);
-    } catch (e) {
-      console.warn(`[history] Failed to remove ${metaPath}:`, e);
+    } catch (error) {
+      console.warn(`[history] Failed to remove ${metaPath}:`, error);
     }
   }
-}
-
-// ============== Protocol ==============
-
-function encodeMessage(msg: DaemonMessage): Uint8Array {
-  const payload = encode(msg);
-  const frame = new Uint8Array(4 + payload.length);
-  const view = new DataView(frame.buffer);
-  view.setUint32(0, payload.length, false);
-  frame.set(payload, 4);
-  return frame;
-}
-
-class MessageParser {
-  private buffer = new Uint8Array(0);
-
-  push(data: Uint8Array): DaemonMessage[] {
-    const newBuf = new Uint8Array(this.buffer.length + data.length);
-    newBuf.set(this.buffer);
-    newBuf.set(data, this.buffer.length);
-    this.buffer = newBuf;
-
-    const messages: DaemonMessage[] = [];
-    while (this.buffer.length >= 4) {
-      const view = new DataView(this.buffer.buffer, this.buffer.byteOffset);
-      const len = view.getUint32(0, false);
-      if (this.buffer.length < 4 + len) break;
-      const payload = this.buffer.slice(4, 4 + len);
-      messages.push(decode(payload) as DaemonMessage);
-      this.buffer = this.buffer.slice(4 + len);
-    }
-    return messages;
-  }
-}
-
-// ============== Daemon Client ==============
-
-class DaemonClient {
-  private socket: any;
-  private parser = new MessageParser();
-  private pendingResolves = new Map<string, (msg: DaemonMessage) => void>();
-  private onOutput?: (session: number, data: Uint8Array) => void;
-  private onExit?: (session: number, code: number) => void;
-  private connected = false;
-  private nextSeq = 1;
-
-  async connect(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      Bun.connect({
-        unix: SOCKET_PATH,
-        socket: {
-          data: (_socket, data) => this.onData(new Uint8Array(data)),
-          open: async (socket) => {
-            this.socket = socket;
-            this.connected = true;
-            // Read token and send Hello handshake
-            const token = await Bun.file(TOKEN_PATH).text();
-            const resp = await this.sendAndWait({ 
-              type: "hello", 
-              token: token.trim(),
-              protocol_version: PROTOCOL_VERSION 
-            }, "hello");
-            if (resp.type === "hello") {
-              resolve();
-            } else {
-              reject(new Error(`Handshake failed: ${resp.message || resp.type}`));
-            }
-          },
-          close: () => {
-            this.connected = false;
-          },
-          error: (_socket, error) => reject(error),
-        },
-      }).catch(reject);
-    });
-  }
-
-  isConnected(): boolean {
-    return this.connected;
-  }
-
-  setOutputHandler(handler: (session: number, data: Uint8Array) => void) {
-    this.onOutput = handler;
-  }
-
-  setExitHandler(handler: (session: number, code: number) => void) {
-    this.onExit = handler;
-  }
-
-  private send(msg: DaemonMessage): void {
-    this.socket.write(encodeMessage({ ...msg, seq: this.nextSeq++ } as any));
-  }
-
-  private async sendAndWait(msg: DaemonMessage, key: string): Promise<DaemonMessage> {
-    return new Promise((resolve) => {
-      this.pendingResolves.set(key, resolve);
-      this.send(msg);
-    });
-  }
-
-  private onData(data: Uint8Array): void {
-    const messages = this.parser.push(data);
-    for (const msg of messages) {
-      if (msg.type === "output") {
-        this.onOutput?.(msg.session, msg.data);
-      } else if (msg.type === "exit") {
-        this.onExit?.(msg.session, msg.code);
-      } else {
-        // Resolve any pending request (ok, error, hello, etc.)
-        const resolver = this.pendingResolves.values().next().value;
-        if (resolver) {
-          this.pendingResolves.clear();
-          resolver(msg);
-        }
-      }
-    }
-  }
-
-  async create(): Promise<number> {
-    const resp = await this.sendAndWait({ type: "create" }, "create");
-    if (resp.type === "ok" && resp.session !== undefined) {
-      return resp.session;
-    }
-    throw new Error(resp.type === "error" ? resp.message : "Unknown error");
-  }
-
-  async list(): Promise<SessionInfo[]> {
-    const resp = await this.sendAndWait({ type: "list" }, "list");
-    if (resp.type === "ok") {
-      return resp.sessions || resp.data || [];
-    }
-    throw new Error(resp.type === "error" ? resp.message : "Unknown error");
-  }
-
-  async attach(session: number): Promise<Snapshot | undefined> {
-    const resp = await this.sendAndWait({ type: "attach", session }, "attach");
-    if (resp.type === "error") {
-      throw new Error(resp.message);
-    }
-    if (resp.type === "ok") {
-      return resp.snapshot;
-    }
-  }
-
-  async detach(session: number): Promise<void> {
-    const resp = await this.sendAndWait({ type: "detach", session }, "detach");
-    if (resp.type === "error") {
-      throw new Error(resp.message);
-    }
-  }
-
-  async kill(session: number): Promise<void> {
-    const resp = await this.sendAndWait({ type: "kill", session }, "kill");
-    if (resp.type === "error") {
-      throw new Error(resp.message);
-    }
-  }
-
-  sendInput(session: number, data: Uint8Array): void {
-    this.send({ type: "input", session, data });
-  }
-
-  sendResize(session: number, cols: number, rows: number): void {
-    this.send({ type: "resize", session, cols, rows });
-  }
-}
-
-// ============== WebSocket Server ==============
-
-// Singleton daemon client
-let sharedDaemon: DaemonClient | null = null;
-
-async function getSharedDaemon(): Promise<DaemonClient> {
-  if (sharedDaemon && sharedDaemon.isConnected()) {
-    return sharedDaemon;
-  }
-  
-  sharedDaemon = new DaemonClient();
-  await sharedDaemon.connect();
-  console.log("[daemon] Shared daemon client connected");
-  return sharedDaemon;
 }
 
 interface ClientContext {
@@ -417,11 +245,12 @@ interface ClientContext {
 }
 
 const clients = new Map<any, ClientContext>();
+let sharedDaemon: PtyDaemonClient | null = null;
 
-// Broadcast output to clients that have this session attached
-function broadcastOutput(session: number, data: Uint8Array) {
+function broadcastOutput(session: number, data: Uint8Array): void {
   appendHistory(session, data);
   const base64 = Buffer.from(data).toString("base64");
+
   for (const [ws, ctx] of clients) {
     if (ctx.attachedSessions.has(session)) {
       ws.send(JSON.stringify({ type: "output", session, data: base64 }));
@@ -429,8 +258,9 @@ function broadcastOutput(session: number, data: Uint8Array) {
   }
 }
 
-function broadcastExit(session: number, code: number) {
+function broadcastExit(session: number, code: number): void {
   void flushHistory(session);
+
   for (const [ws, ctx] of clients) {
     if (ctx.attachedSessions.has(session)) {
       ctx.attachedSessions.delete(session);
@@ -439,33 +269,85 @@ function broadcastExit(session: number, code: number) {
   }
 }
 
-async function handleWebSocketMessage(ws: any, ctx: ClientContext, msg: WebSocketMessage) {
+function wireDaemonEvents(daemon: PtyDaemonClient): void {
+  daemon.on("output", (event) => {
+    broadcastOutput(event.session, event.data);
+  });
+
+  daemon.on("exit", (event) => {
+    broadcastExit(event.session, event.code);
+  });
+
+  daemon.on("error", (error) => {
+    console.error("[daemon] SDK client error:", error);
+  });
+
+  daemon.on("close", () => {
+    if (sharedDaemon === daemon) {
+      sharedDaemon = null;
+    }
+  });
+}
+
+async function getSharedDaemon(): Promise<PtyDaemonClient> {
+  if (sharedDaemon?.isConnected) {
+    return sharedDaemon;
+  }
+
+  if (sharedDaemon) {
+    sharedDaemon.removeAllListeners();
+    sharedDaemon.close();
+    sharedDaemon = null;
+  }
+
+  const binaryPath = resolveDaemonBinaryPath();
+  const daemon = createPtyClient({
+    socketPath: SOCKET_PATH,
+    tokenPath: TOKEN_PATH,
+    protocolVersion: PROTOCOL_VERSION,
+    autoStart: AUTO_START_DAEMON,
+    daemon: {
+      ...(binaryPath ? { binaryPath } : {}),
+      timeoutMs: 5000,
+    },
+  });
+
+  await daemon.waitForConnection();
+  wireDaemonEvents(daemon);
+  sharedDaemon = daemon;
+  console.log("[daemon] Shared daemon client connected via SDK");
+  return daemon;
+}
+
+async function handleWebSocketMessage(ws: any, ctx: ClientContext, msg: WebSocketMessage): Promise<void> {
   console.log("[ws] Received message:", msg.type, msg);
+
   try {
     const daemon = await getSharedDaemon();
-    
+
     switch (msg.type) {
       case "create": {
-        console.log("[ws] Creating new session...");
-        const id = await daemon.create();
-        console.log("[ws] Session created:", id);
-        clearHistory(id);
-        ws.send(JSON.stringify({ type: "created", session: id }));
+        const { session } = await daemon.create();
+        clearHistory(session);
+        ws.send(JSON.stringify({ type: "created", session }));
         break;
       }
+
       case "list": {
-        const sessions = await daemon.list();
+        const sessions: SessionInfo[] = await daemon.list();
         ws.send(JSON.stringify({ type: "sessions", sessions }));
         break;
       }
+
       case "attach": {
-        const snapshot = await daemon.attach(msg.session);
+        const { snapshot } = await daemon.attach(msg.session);
         const history = await readHistoryTail(msg.session);
         const historyBase64 = history ? history.toString("base64") : undefined;
         ctx.attachedSessions.add(msg.session);
         ws.send(JSON.stringify({ type: "attached", session: msg.session, snapshot, history: historyBase64 }));
         break;
       }
+
       case "kill": {
         await daemon.kill(msg.session);
         ctx.attachedSessions.delete(msg.session);
@@ -473,29 +355,30 @@ async function handleWebSocketMessage(ws: any, ctx: ClientContext, msg: WebSocke
         ws.send(JSON.stringify({ type: "killed", session: msg.session }));
         break;
       }
+
       case "input": {
-        const data = Uint8Array.from(atob(msg.data), (c) => c.charCodeAt(0));
-        daemon.sendInput(msg.session, data);
+        const data = Uint8Array.from(Buffer.from(msg.data, "base64"));
+        daemon.input(msg.session, data);
         break;
       }
+
       case "resize": {
-        daemon.sendResize(msg.session, msg.cols, msg.rows);
+        daemon.resize(msg.session, msg.cols, msg.rows);
         break;
       }
     }
-  } catch (e: any) {
-    ws.send(JSON.stringify({ type: "error", message: e.message }));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    ws.send(JSON.stringify({ type: "error", message }));
   }
 }
 
-// ============== HTTP Server ==============
-
-const server = Bun.serve({
+Bun.serve({
   port: PORT,
+
   async fetch(req, server) {
     const url = new URL(req.url);
 
-    // WebSocket upgrade
     if (url.pathname === "/ws") {
       if (server.upgrade(req)) {
         return;
@@ -503,15 +386,13 @@ const server = Bun.serve({
       return new Response("WebSocket upgrade failed", { status: 400 });
     }
 
-    // Serve static files from public/
-    let filePath = url.pathname === "/" ? "/index.html" : url.pathname;
-    
-    // Try serving from public/dist first (bundled JS), then public/
+    const filePath = url.pathname === "/" ? "/index.html" : url.pathname;
+
     const distFile = Bun.file(`./public/dist${filePath}`);
     if (await distFile.exists()) {
       return new Response(distFile);
     }
-    
+
     const publicFile = Bun.file(`./public${filePath}`);
     if (await publicFile.exists()) {
       return new Response(publicFile);
@@ -523,42 +404,35 @@ const server = Bun.serve({
   websocket: {
     async open(ws) {
       console.log("[ws] WebSocket client connected");
-      
+
       try {
         const daemon = await getSharedDaemon();
-        
-        // Set up handlers on first connection
-        if (clients.size === 0) {
-          daemon.setOutputHandler(broadcastOutput);
-          daemon.setExitHandler(broadcastExit);
-        }
-
         const ctx: ClientContext = {
           attachedSessions: new Set(),
         };
         clients.set(ws, ctx);
-        
-        // Send initial session list
-        console.log("[ws] Fetching session list...");
+
         const sessions = await daemon.list();
-        console.log("[ws] Sessions:", sessions);
         ws.send(JSON.stringify({ type: "sessions", sessions }));
-      } catch (e) {
-        console.error("[ws] Failed to connect to daemon:", e);
-        ws.send(JSON.stringify({ type: "error", message: "Failed to connect to PTY daemon" }));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error("[ws] Failed to connect to daemon:", error);
+        ws.send(JSON.stringify({ type: "error", message: `Failed to connect to PTY daemon: ${message}` }));
         ws.close();
       }
     },
 
     message(ws, message) {
       const ctx = clients.get(ws);
-      if (!ctx) return;
+      if (!ctx) {
+        return;
+      }
 
       try {
         const msg = JSON.parse(message.toString()) as WebSocketMessage;
-        handleWebSocketMessage(ws, ctx, msg);
-      } catch (e) {
-        console.error("Invalid message:", e);
+        void handleWebSocketMessage(ws, ctx, msg);
+      } catch (error) {
+        console.error("Invalid message:", error);
       }
     },
 
