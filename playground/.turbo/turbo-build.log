@@ -1,5 +1,0 @@
-$ bun build public/main.ts --outdir public/dist
-Bundled 5 modules in 34ms
-
-  main.js  0.62 MB  (entry point)
-
