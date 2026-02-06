@@ -1,0 +1,173 @@
+use rustix::fd::{BorrowedFd, IntoRawFd, OwnedFd};
+use rustix::pty::{grantpt, openpt, ptsname, unlockpt, OpenptFlags};
+use rustix::termios::{tcsetwinsize, Winsize};
+use std::collections::HashMap;
+use std::ffi::CString;
+use std::io;
+
+pub struct PtyHandle {
+    pub master_fd: i32,
+    pub pts_path: String,
+    pub child_pid: i32,
+}
+
+impl PtyHandle {
+    pub fn spawn(
+        cwd: &str,
+        shell: Option<&str>,
+        env: Option<&HashMap<String, String>>,
+        cols: u16,
+        rows: u16,
+    ) -> io::Result<Self> {
+        let master: OwnedFd = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        grantpt(&master).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        unlockpt(&master).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        let pts_path = ptsname(&master, Vec::new())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+            .to_string_lossy()
+            .into_owned();
+
+        let master_fd = master.into_raw_fd();
+        let child_pid = unsafe { spawn_child(&pts_path, cwd, shell, env, cols, rows) };
+
+        if child_pid < 0 {
+            unsafe { libc::close(master_fd) };
+            return Err(io::Error::new(io::ErrorKind::Other, "fork failed"));
+        }
+
+        Ok(Self {
+            master_fd,
+            pts_path,
+            child_pid,
+        })
+    }
+
+    pub fn write(&self, data: &[u8]) -> io::Result<usize> {
+        let fd = unsafe { BorrowedFd::borrow_raw(self.master_fd) };
+        rustix::io::write(fd, data).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
+        let fd = unsafe { BorrowedFd::borrow_raw(self.master_fd) };
+        let ws = Winsize {
+            ws_col: cols,
+            ws_row: rows,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        tcsetwinsize(fd, ws).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    }
+
+    pub fn send_signal(&self, signal: i32) -> io::Result<()> {
+        let ret = unsafe { libc::kill(self.child_pid, signal) };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    pub fn close(&self) {
+        unsafe { libc::close(self.master_fd) };
+    }
+}
+
+unsafe fn spawn_child(
+    pts_path: &str,
+    cwd: &str,
+    shell: Option<&str>,
+    env: Option<&HashMap<String, String>>,
+    cols: u16,
+    rows: u16,
+) -> i32 {
+    let pid = libc::fork();
+    if pid != 0 {
+        return pid;
+    }
+
+    // Child process
+    libc::setsid();
+
+    let pts = CString::new(pts_path).unwrap();
+    let fd = libc::open(pts.as_ptr(), libc::O_RDWR);
+    if fd < 0 {
+        libc::_exit(1);
+    }
+
+    libc::ioctl(fd, libc::TIOCSCTTY as _, 0);
+    libc::dup2(fd, 0);
+    libc::dup2(fd, 1);
+    libc::dup2(fd, 2);
+    if fd > 2 {
+        libc::close(fd);
+    }
+
+    // Set window size
+    let ws = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    libc::ioctl(0, libc::TIOCSWINSZ, &ws);
+
+    // Change directory
+    if let Ok(cwd_cstr) = CString::new(cwd) {
+        libc::chdir(cwd_cstr.as_ptr());
+    }
+
+    // Set TERM
+    let term_key = CString::new("TERM").unwrap();
+    let term_val = CString::new("xterm-256color").unwrap();
+    libc::setenv(term_key.as_ptr(), term_val.as_ptr(), 1);
+
+    // Set custom env
+    if let Some(env_map) = env {
+        for (key, value) in env_map {
+            if let (Ok(k), Ok(v)) = (CString::new(key.as_str()), CString::new(value.as_str())) {
+                libc::setenv(k.as_ptr(), v.as_ptr(), 1);
+            }
+        }
+    }
+
+    // Get shell
+    let shell_path = shell
+        .map(String::from)
+        .or_else(|| std::env::var("SHELL").ok())
+        .unwrap_or_else(|| "/bin/sh".into());
+
+    let shell_cstr = CString::new(shell_path.clone()).unwrap();
+    let is_interactive = shell_path.contains("zsh")
+        || shell_path.contains("bash")
+        || shell_path.contains("fish");
+
+    if is_interactive {
+        let arg = CString::new("-l").unwrap();
+        let args = [shell_cstr.as_ptr(), arg.as_ptr(), std::ptr::null()];
+        libc::execvp(shell_cstr.as_ptr(), args.as_ptr());
+    } else {
+        let args = [shell_cstr.as_ptr(), std::ptr::null()];
+        libc::execvp(shell_cstr.as_ptr(), args.as_ptr());
+    }
+
+    libc::_exit(1);
+}
+
+pub fn parse_signal(signal: &str) -> Option<i32> {
+    match signal.to_uppercase().as_str() {
+        "SIGINT" | "INT" | "2" => Some(libc::SIGINT),
+        "SIGTERM" | "TERM" | "15" => Some(libc::SIGTERM),
+        "SIGKILL" | "KILL" | "9" => Some(libc::SIGKILL),
+        "SIGHUP" | "HUP" | "1" => Some(libc::SIGHUP),
+        "SIGQUIT" | "QUIT" | "3" => Some(libc::SIGQUIT),
+        "SIGUSR1" | "USR1" | "10" => Some(libc::SIGUSR1),
+        "SIGUSR2" | "USR2" | "12" => Some(libc::SIGUSR2),
+        "SIGCONT" | "CONT" | "18" => Some(libc::SIGCONT),
+        "SIGSTOP" | "STOP" | "19" => Some(libc::SIGSTOP),
+        "SIGTSTP" | "TSTP" | "20" => Some(libc::SIGTSTP),
+        _ => None,
+    }
+}
