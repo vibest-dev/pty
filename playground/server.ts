@@ -315,13 +315,10 @@ async function getSharedDaemon(): Promise<PtyDaemonClient> {
   await daemon.waitForConnection();
   wireDaemonEvents(daemon);
   sharedDaemon = daemon;
-  console.log("[daemon] Shared daemon client connected via SDK");
   return daemon;
 }
 
 async function handleWebSocketMessage(ws: any, ctx: ClientContext, msg: WebSocketMessage): Promise<void> {
-  console.log("[ws] Received message:", msg.type, msg);
-
   try {
     const daemon = await getSharedDaemon();
 
@@ -403,8 +400,6 @@ Bun.serve({
 
   websocket: {
     async open(ws) {
-      console.log("[ws] WebSocket client connected");
-
       try {
         const daemon = await getSharedDaemon();
         const ctx: ClientContext = {
@@ -437,7 +432,6 @@ Bun.serve({
     },
 
     close(ws) {
-      console.log("WebSocket client disconnected");
       clients.delete(ws);
     },
   },
