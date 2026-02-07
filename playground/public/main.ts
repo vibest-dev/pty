@@ -167,7 +167,6 @@ function connect() {
 }
 
 function send(msg: object) {
-  console.log("[ui] Sending:", msg);
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     console.error("[ui] WebSocket not connected, readyState:", ws?.readyState);
     return;
@@ -464,7 +463,6 @@ function updateStatus() {
 // ============== Init ==============
 
 newTabBtn.addEventListener("click", () => {
-  console.log("[ui] New tab clicked, sending create...");
   send({ type: "create" });
 });
 
