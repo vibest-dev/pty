@@ -8,6 +8,12 @@ pub struct Config {
     pub max_connections: u32,
     pub max_sessions: usize,
     pub scrollback_lines: usize,
+    // Flow control settings
+    pub flow_yellow_threshold: usize,
+    pub flow_red_threshold: usize,
+    pub flow_yellow_interval_ms: u64,
+    pub flow_red_interval_ms: u64,
+    pub flow_auto_disconnect: bool,
 }
 
 impl Config {
@@ -38,6 +44,54 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(10000);
 
+        let flow_yellow_threshold = std::env::var("RUST_PTY_FLOW_YELLOW_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1024);
+
+        let flow_red_threshold = std::env::var("RUST_PTY_FLOW_RED_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4096);
+
+        let flow_yellow_interval_ms = std::env::var("RUST_PTY_FLOW_YELLOW_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+
+        let flow_red_interval_ms = std::env::var("RUST_PTY_FLOW_RED_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+
+        let flow_auto_disconnect = std::env::var("RUST_PTY_FLOW_AUTO_DISCONNECT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(false);
+
+        // Validation
+        if flow_yellow_threshold >= flow_red_threshold {
+            panic!(
+                "Invalid flow control config: yellow threshold ({}) must be < red threshold ({})",
+                flow_yellow_threshold, flow_red_threshold
+            );
+        }
+
+        if flow_yellow_threshold == 0 {
+            panic!("Invalid flow control config: yellow threshold must be > 0");
+        }
+
+        if flow_yellow_interval_ms == 0 || flow_red_interval_ms == 0 {
+            panic!("Invalid flow control config: intervals must be > 0");
+        }
+
+        if flow_yellow_interval_ms >= flow_red_interval_ms {
+            eprintln!(
+                "[WARN] Yellow interval ({} ms) >= red interval ({} ms). Red zone will not be more restrictive.",
+                flow_yellow_interval_ms, flow_red_interval_ms
+            );
+        }
+
         Self {
             socket_path,
             token_path,
@@ -45,6 +99,11 @@ impl Config {
             max_connections,
             max_sessions,
             scrollback_lines,
+            flow_yellow_threshold,
+            flow_red_threshold,
+            flow_yellow_interval_ms,
+            flow_red_interval_ms,
+            flow_auto_disconnect,
         }
     }
 }

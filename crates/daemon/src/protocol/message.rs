@@ -43,6 +43,11 @@ pub enum Request {
     ClearScrollback {
         session: u32,
     },
+    /// Client acknowledges processing N messages (optional flow control)
+    Ack {
+        session: u32,
+        count: usize,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +107,20 @@ pub enum Response {
         #[serde(skip_serializing_if = "Option::is_none")]
         signal: Option<i32>,
     },
+    /// Backpressure warning event
+    BackpressureWarning {
+        session: u32,
+        queue_size: usize,
+        level: BackpressureLevel,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackpressureLevel {
+    Green,
+    Yellow,
+    Red,
 }
 
 impl Response {

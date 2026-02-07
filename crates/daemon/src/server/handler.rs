@@ -4,7 +4,7 @@ use crate::protocol::{read_message, write_message, Request, RequestEnvelope, Res
 use crate::session::{manager, OutputEvent};
 use std::collections::{HashMap, HashSet};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -21,7 +21,9 @@ struct ClientState {
     /// Output forwarder thread
     output_thread: Option<JoinHandle<()>>,
     stop_flag: Arc<AtomicBool>,
-    output_tx: Option<mpsc::SyncSender<OutputEvent>>,
+    output_tx: Option<mpsc::Sender<OutputEvent>>,
+    /// Count of messages processed (for ACK tracking)
+    processed_count: Arc<AtomicUsize>,
 }
 
 impl Default for ClientState {
@@ -33,6 +35,7 @@ impl Default for ClientState {
             output_thread: None,
             stop_flag: Arc::new(AtomicBool::new(false)),
             output_tx: None,
+            processed_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -75,15 +78,16 @@ fn cleanup(state: &mut ClientState) {
 fn ensure_output_thread(
     state: &mut ClientState,
     stream: &mut UnixStream,
-) -> Result<mpsc::SyncSender<OutputEvent>, String> {
+) -> Result<mpsc::Sender<OutputEvent>, String> {
     if let Some(tx) = state.output_tx.clone() {
         return Ok(tx);
     }
 
-    let (tx, rx) = mpsc::sync_channel::<OutputEvent>(256);
+    let (tx, rx) = mpsc::channel::<OutputEvent>();
     state.output_tx = Some(tx.clone());
 
     let stop_flag = Arc::clone(&state.stop_flag);
+    let processed_count = Arc::clone(&state.processed_count);
     let mut stream_clone = stream.try_clone().map_err(|e| e.to_string())?;
 
     state.output_thread = Some(thread::spawn(move || {
@@ -99,10 +103,14 @@ fn ensure_output_thread(
                         OutputEvent::Exit { session, code, signal } => {
                             Response::Exit { session, code, signal }
                         }
+                        OutputEvent::BackpressureWarning { session, queue_size, level } => {
+                            Response::BackpressureWarning { session, queue_size, level }
+                        }
                     };
                     if write_message(&mut stream_clone, &response).is_err() {
                         break;
                     }
+                    processed_count.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -247,6 +255,14 @@ fn handle(stream: &mut UnixStream, state: &mut ClientState, seq: u32, req: Reque
                 Ok(_) => Some(Response::ok_session(seq, session)),
                 Err(e) => Some(Response::error(seq, e.code(), e.to_string())),
             }
+        }
+
+        Request::Ack { session, count } => {
+            // Find subscriber ID for this session
+            if let Some(&sub_id) = state.session_sub_ids.get(&session) {
+                mgr.ack_messages(session, sub_id, count);
+            }
+            None // No response needed
         }
     }
 }

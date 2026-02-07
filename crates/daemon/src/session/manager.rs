@@ -1,16 +1,16 @@
 use super::{Emulator, PtyHandle};
 use crate::config::config;
 use crate::error::{Error, Result};
-use crate::protocol::{CreateOptions, SessionInfo, Snapshot};
+use crate::protocol::{BackpressureLevel, CreateOptions, SessionInfo, Snapshot};
 use chrono::{DateTime, Utc};
 use rustix::event::{poll, PollFd, PollFlags};
 use rustix::fd::BorrowedFd;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::mpsc::{self, SyncSender};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub static MANAGER: OnceLock<Manager> = OnceLock::new();
 
@@ -23,11 +23,19 @@ pub fn manager() -> &'static Manager {
 pub enum OutputEvent {
     Data { session: u32, data: Vec<u8> },
     Exit { session: u32, code: i32, signal: Option<i32> },
+    BackpressureWarning {
+        session: u32,
+        queue_size: usize,
+        level: BackpressureLevel,
+    },
 }
 
 struct SessionSubscriber {
     id: u64,
-    tx: SyncSender<OutputEvent>,
+    tx: Sender<OutputEvent>,
+    pending_count: Arc<AtomicUsize>,
+    last_sent_time: Arc<Mutex<Instant>>,
+    last_warning_level: Arc<AtomicU8>,
 }
 
 pub struct Session {
@@ -100,7 +108,7 @@ impl Manager {
     pub fn add_session_subscriber(
         &self,
         session_id: u32,
-        tx: SyncSender<OutputEvent>,
+        tx: Sender<OutputEvent>,
     ) -> Result<u64> {
         if !self.sessions.read().unwrap().contains_key(&session_id) {
             return Err(Error::NotFound(format!("session {}", session_id)));
@@ -108,10 +116,37 @@ impl Manager {
 
         let id = self.next_sub_id.fetch_add(1, Ordering::SeqCst) as u64;
         let mut subs = self.session_subscribers.write().unwrap();
-        subs.entry(session_id)
-            .or_default()
-            .push(SessionSubscriber { id, tx });
+        subs.entry(session_id).or_default().push(SessionSubscriber {
+            id,
+            tx,
+            pending_count: Arc::new(AtomicUsize::new(0)),
+            last_sent_time: Arc::new(Mutex::new(Instant::now())),
+            last_warning_level: Arc::new(AtomicU8::new(0)),
+        });
         Ok(id)
+    }
+
+    /// Acknowledge processed messages (for flow control)
+    pub fn ack_messages(&self, session_id: u32, subscriber_id: u64, count: usize) {
+        let subs = self.session_subscribers.read().unwrap();
+        if let Some(list) = subs.get(&session_id) {
+            if let Some(sub) = list.iter().find(|s| s.id == subscriber_id) {
+                // Use atomic compare-exchange loop for safe decrement
+                let mut current = sub.pending_count.load(Ordering::Acquire);
+                loop {
+                    let new_val = current.saturating_sub(count);
+                    match sub.pending_count.compare_exchange_weak(
+                        current,
+                        new_val,
+                        Ordering::Release,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => break,
+                        Err(x) => current = x,
+                    }
+                }
+            }
+        }
     }
 
     /// Remove a subscriber for a specific session
@@ -125,17 +160,141 @@ impl Manager {
         }
     }
 
-    /// Broadcast event to subscribers of the session
+    /// Broadcast event to subscribers of the session with flow control
     fn broadcast_event(&self, event: OutputEvent) {
         let session_id = match event {
             OutputEvent::Data { session, .. } => session,
             OutputEvent::Exit { session, .. } => session,
+            OutputEvent::BackpressureWarning { session, .. } => session,
         };
 
+        let cfg = config();
         let mut subs = self.session_subscribers.write().unwrap();
+
         let remove = match subs.get_mut(&session_id) {
             Some(list) => {
-                list.retain(|sub| sub.tx.try_send(event.clone()).is_ok());
+                let mut disconnected = Vec::new();
+
+                for (idx, sub) in list.iter().enumerate() {
+                    // For backpressure warnings, just send them directly without flow control
+                    if matches!(event, OutputEvent::BackpressureWarning { .. }) {
+                        if sub.tx.send(event.clone()).is_err() {
+                            disconnected.push(idx);
+                        }
+                        continue;
+                    }
+
+                    // Increment pending BEFORE checking level to avoid race condition
+                    let new_pending = sub.pending_count.fetch_add(1, Ordering::Release);
+
+                    // Hard limit to prevent OOM
+                    const MAX_QUEUE_SIZE: usize = 65536;
+                    if new_pending > MAX_QUEUE_SIZE {
+                        eprintln!(
+                            "[WARN] Force disconnecting session {} subscriber {} due to queue overflow ({} messages)",
+                            session_id, sub.id, new_pending
+                        );
+                        disconnected.push(idx);
+                        sub.pending_count.fetch_sub(1, Ordering::Release);
+                        continue;
+                    }
+
+                    // Determine backpressure level based on NEW count
+                    let level = if new_pending < cfg.flow_yellow_threshold {
+                        0 // Green
+                    } else if new_pending < cfg.flow_red_threshold {
+                        1 // Yellow
+                    } else {
+                        2 // Red
+                    };
+
+                    let should_send = match level {
+                        0 => {
+                            // Green zone: send immediately
+                            true
+                        }
+                        1 => {
+                            // Yellow zone: rate limit to flow_yellow_interval_ms
+                            let now = Instant::now();
+                            let last = *sub.last_sent_time.lock().unwrap();
+                            now.duration_since(last).as_millis() >= cfg.flow_yellow_interval_ms as u128
+                        }
+                        2 => {
+                            // Red zone: severe rate limit or disconnect
+                            if cfg.flow_auto_disconnect {
+                                eprintln!(
+                                    "[WARN] Auto-disconnecting session {} subscriber {} due to red zone backpressure",
+                                    session_id, sub.id
+                                );
+                                disconnected.push(idx);
+                                sub.pending_count.fetch_sub(1, Ordering::Release);
+                                false
+                            } else {
+                                let now = Instant::now();
+                                let last = *sub.last_sent_time.lock().unwrap();
+                                now.duration_since(last).as_millis() >= cfg.flow_red_interval_ms as u128
+                            }
+                        }
+                        _ => false,
+                    };
+
+                    if should_send {
+                        if sub.tx.send(event.clone()).is_ok() {
+                            *sub.last_sent_time.lock().unwrap() = Instant::now();
+
+                            // Send backpressure warning on level change (with deduplication)
+                            let prev_level = sub.last_warning_level.load(Ordering::Acquire);
+                            if level > 0 && level != prev_level as usize {
+                                let warning = OutputEvent::BackpressureWarning {
+                                    session: session_id,
+                                    queue_size: new_pending,
+                                    level: match level {
+                                        1 => BackpressureLevel::Yellow,
+                                        2 => BackpressureLevel::Red,
+                                        _ => BackpressureLevel::Green,
+                                    },
+                                };
+                                let _ = sub.tx.send(warning);
+                                sub.last_warning_level.store(level as u8, Ordering::Release);
+
+                                eprintln!(
+                                    "[WARN] Session {} subscriber {} entered {} zone with {} pending messages",
+                                    session_id,
+                                    sub.id,
+                                    if level == 1 { "yellow" } else { "red" },
+                                    new_pending
+                                );
+                            } else if level == 0 && prev_level > 0 {
+                                // Send "back to green" notification
+                                let warning = OutputEvent::BackpressureWarning {
+                                    session: session_id,
+                                    queue_size: new_pending,
+                                    level: BackpressureLevel::Green,
+                                };
+                                let _ = sub.tx.send(warning);
+                                sub.last_warning_level.store(0, Ordering::Release);
+
+                                eprintln!(
+                                    "[INFO] Session {} subscriber {} returned to green zone ({} pending)",
+                                    session_id, sub.id, new_pending
+                                );
+                            }
+                        } else {
+                            // Disconnected
+                            disconnected.push(idx);
+                            sub.pending_count.fetch_sub(1, Ordering::Release);
+                        }
+                    } else {
+                        // Didn't send, rollback the increment
+                        sub.pending_count.fetch_sub(1, Ordering::Release);
+                    }
+                }
+
+                // Remove disconnected subscribers in reverse order to maintain indices
+                for idx in disconnected.iter().rev() {
+                    list.remove(*idx);
+                }
+
                 list.is_empty()
             }
             None => return,

@@ -77,6 +77,7 @@ export type InputRequest = { type: "input"; session: number; data: Uint8Array };
 export type ResizeRequest = { type: "resize"; session: number; cols: number; rows: number };
 export type SignalRequest = { type: "signal"; session: number; signal: string };
 export type ClearScrollbackRequest = { type: "clear_scrollback"; session: number };
+export type AckRequest = { type: "ack"; session: number; count: number };
 
 export type RequestMessage =
   | HandshakeRequest
@@ -89,7 +90,8 @@ export type RequestMessage =
   | InputRequest
   | ResizeRequest
   | SignalRequest
-  | ClearScrollbackRequest;
+  | ClearScrollbackRequest
+  | AckRequest;
 
 type RequestNoSeq = RequestMessage;
 
@@ -122,9 +124,17 @@ type HandshakeWireResponse = Omit<HandshakeResponse, "seq"> & {
 
 export type ReplyMessage = HandshakeResponse | DaemonOkResponse | DaemonErrorResponse;
 
+export type BackpressureLevel = "green" | "yellow" | "red";
+
 export type OutputEvent = { type: "output"; session: number; data: Uint8Array };
 export type ExitEvent = { type: "exit"; session: number; code: number; signal?: number };
-export type EventMessage = OutputEvent | ExitEvent;
+export type BackpressureWarningEvent = {
+  type: "backpressure_warning";
+  session: number;
+  queue_size: number;
+  level: BackpressureLevel;
+};
+export type EventMessage = OutputEvent | ExitEvent | BackpressureWarningEvent;
 
 type RequestOptions = {
   timeoutMs?: number;
@@ -189,6 +199,19 @@ function isExitEvent(value: unknown): value is ExitEvent {
   );
 }
 
+function isBackpressureWarningEvent(value: unknown): value is BackpressureWarningEvent {
+  if (!isRecord(value)) {
+    return false;
+  }
+  return (
+    value.type === "backpressure_warning" &&
+    typeof value.session === "number" &&
+    typeof value.queue_size === "number" &&
+    typeof value.level === "string" &&
+    ["green", "yellow", "red"].includes(value.level as string)
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Error class
 // ---------------------------------------------------------------------------
@@ -234,6 +257,8 @@ export class PtyDaemonClient extends EventEmitter {
   private handshakePromise: Promise<HandshakeResponse> | null = null;
   private seq = 1;
   private closed = false;
+  private processedCounts: Map<number, number> = new Map();
+  private ackThreshold = 100;
 
   constructor(options: ClientOptions) {
     super();
@@ -392,6 +417,22 @@ export class PtyDaemonClient extends EventEmitter {
     this.unwrapOk(await this.requestRaw({ type: "clear_scrollback", session }, reqOptions));
   }
 
+  /**
+   * Acknowledge processed messages for flow control
+   * This helps the daemon track backpressure and prevent disconnections
+   */
+  ack(session: number, count: number): void {
+    this.notifyRaw({ type: "ack", session, count });
+  }
+
+  /**
+   * Set the threshold for automatic ACKs (default: 100 messages)
+   * Set to 0 to disable automatic ACKs
+   */
+  setAckThreshold(threshold: number): void {
+    this.ackThreshold = threshold;
+  }
+
   // ---- Internal helpers ----------------------------------------------------
 
   private unwrapOk(reply: ReplyMessage): DaemonOkResponse {
@@ -476,8 +517,30 @@ export class PtyDaemonClient extends EventEmitter {
           continue;
         }
 
-        if (isOutputEvent(message) || isExitEvent(message)) {
+        if (isOutputEvent(message)) {
           this.emit(message.type, message);
+          // Auto-ACK if enabled
+          if (this.ackThreshold > 0) {
+            const session = message.session;
+            const count = (this.processedCounts.get(session) ?? 0) + 1;
+            this.processedCounts.set(session, count);
+            if (count >= this.ackThreshold) {
+              this.ack(session, count);
+              this.processedCounts.set(session, 0);
+            }
+          }
+          continue;
+        }
+
+        if (isExitEvent(message)) {
+          this.emit(message.type, message);
+          // Clean up processed counts for this session
+          this.processedCounts.delete(message.session);
+          continue;
+        }
+
+        if (isBackpressureWarningEvent(message)) {
+          this.emit("backpressure_warning", message);
         }
       }
     } catch (err) {
