@@ -1,4 +1,5 @@
 use crate::auth;
+use crate::config::config;
 use crate::error::Error;
 use crate::protocol::{read_message_async, write_message_async, Request, RequestEnvelope, Response, PROTOCOL_VERSION};
 use crate::session::{manager, OutputEvent};
@@ -12,6 +13,8 @@ struct ClientState {
     attached_sessions: HashSet<u32>,
     /// Session subscriber IDs
     session_sub_ids: HashMap<u32, u64>,
+    /// Sender paired with output_rx. Reused for all session subscriptions.
+    output_tx: Option<tokio::sync::mpsc::Sender<OutputEvent>>,
     /// Output receiver for subscribed sessions
     output_rx: Option<tokio::sync::mpsc::Receiver<OutputEvent>>,
 }
@@ -22,6 +25,7 @@ impl Default for ClientState {
             authenticated: false,
             attached_sessions: HashSet::new(),
             session_sub_ids: HashMap::new(),
+            output_tx: None,
             output_rx: None,
         }
     }
@@ -77,21 +81,19 @@ async fn cleanup(state: &mut ClientState) {
         manager().remove_session_subscriber(session_id, sub_id).await;
     }
     state.attached_sessions.clear();
+    state.output_tx.take();
     state.output_rx.take();
 }
 
 async fn ensure_output_channel(
     state: &mut ClientState,
 ) -> Result<tokio::sync::mpsc::Sender<OutputEvent>, String> {
-    if state.output_rx.is_none() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<OutputEvent>(16384); // Use config value
-        state.output_rx = Some(rx);
-        return Ok(tx);
+    if let Some(tx) = state.output_tx.as_ref() {
+        return Ok(tx.clone());
     }
 
-    // Return a cloned sender (we need to get it from manager or store it)
-    // For simplicity, recreate channel each time - manager will handle multiple subscribers
-    let (tx, rx) = tokio::sync::mpsc::channel::<OutputEvent>(16384);
+    let (tx, rx) = tokio::sync::mpsc::channel::<OutputEvent>(config().flow_max_queue_size);
+    state.output_tx = Some(tx.clone());
     state.output_rx = Some(rx);
     Ok(tx)
 }
@@ -237,5 +239,51 @@ async fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Opti
             // They handle backpressure automatically
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ensure_output_channel_reuses_existing_receiver() {
+        let mut state = ClientState::default();
+
+        let first = ensure_output_channel(&mut state)
+            .await
+            .expect("first channel should be created");
+        let second = ensure_output_channel(&mut state)
+            .await
+            .expect("second channel should reuse existing receiver");
+
+        first
+            .try_send(OutputEvent::Data {
+                session: 1,
+                data: vec![1],
+            })
+            .expect("first sender should remain valid");
+        second
+            .try_send(OutputEvent::Data {
+                session: 1,
+                data: vec![2],
+            })
+            .expect("second sender should target same receiver");
+
+        let rx = state
+            .output_rx
+            .as_mut()
+            .expect("receiver should exist after channel initialization");
+
+        let mut payloads = Vec::new();
+        for _ in 0..2 {
+            match rx.recv().await.expect("channel should yield two events") {
+                OutputEvent::Data { data, .. } => payloads.push(data[0]),
+                other => panic!("unexpected event type: {:?}", other),
+            }
+        }
+        payloads.sort_unstable();
+
+        assert_eq!(payloads, vec![1, 2]);
     }
 }

@@ -50,12 +50,6 @@ impl Emulator {
         }
     }
 
-    pub fn write(&mut self, data: &[u8]) {
-        for &byte in data {
-            self.process_byte(byte);
-        }
-    }
-
     pub fn resize(&mut self, cols: u16, rows: u16) {
         let new_screen = vec![vec![' '; cols as usize]; rows as usize];
         let mut screen = new_screen;
@@ -76,10 +70,6 @@ impl Emulator {
 
     pub fn clear_scrollback(&mut self) {
         self.scrollback.clear();
-    }
-
-    pub fn set_cwd(&mut self, cwd: String) {
-        self.cwd = Some(cwd);
     }
 
     pub fn snapshot(&self) -> Snapshot {

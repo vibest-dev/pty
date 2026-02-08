@@ -68,7 +68,24 @@ async function stopDaemon(child) {
 	if (!child) return;
 	if (child.exitCode !== null) return;
 	await new Promise((resolve) => {
-		child.once("exit", () => resolve());
+		let finished = false;
+		const finish = () => {
+			if (finished) return;
+			finished = true;
+			resolve();
+		};
+		const termTimer = setTimeout(() => {
+			if (child.exitCode === null) child.kill("SIGKILL");
+			const killTimer = setTimeout(() => finish(), 1e3);
+			child.once("exit", () => {
+				clearTimeout(killTimer);
+				finish();
+			});
+		}, 2e3);
+		child.once("exit", () => {
+			clearTimeout(termTimer);
+			finish();
+		});
 		child.kill("SIGTERM");
 	});
 }
@@ -182,6 +199,14 @@ function isExitEvent(value) {
 	if (!isRecord(value)) return false;
 	return value.type === "exit" && typeof value.session === "number" && typeof value.code === "number" && (typeof value.signal === "number" || typeof value.signal === "undefined");
 }
+function isBackpressureWarningEvent(value) {
+	if (!isRecord(value)) return false;
+	return value.type === "backpressure_warning" && typeof value.session === "number" && typeof value.queue_size === "number" && typeof value.level === "string" && [
+		"green",
+		"yellow",
+		"red"
+	].includes(value.level);
+}
 var DaemonError = class extends Error {
 	constructor(code, message) {
 		super(`${code}: ${message}`);
@@ -206,6 +231,9 @@ var PtyDaemonClient = class extends EventEmitter {
 	handshakePromise = null;
 	seq = 1;
 	closed = false;
+	processedCounts = /* @__PURE__ */ new Map();
+	ackThreshold = 100;
+	manualAckMode = false;
 	constructor(options) {
 		super();
 		this.socketPath = options.socketPath;
@@ -215,6 +243,10 @@ var PtyDaemonClient = class extends EventEmitter {
 		this.autoStart = options.autoStart ?? true;
 		this.requestTimeoutMs = options.requestTimeoutMs;
 		this.daemonOptions = options.daemon ?? {};
+		const flowControl = options.flowControl ?? {};
+		this.ackThreshold = flowControl.ackThreshold ?? 100;
+		this.manualAckMode = flowControl.manualAck ?? false;
+		if (this.manualAckMode) this.ackThreshold = 0;
 	}
 	async waitForConnection() {
 		if (this.autoStart) this.startedDaemon = await ensureDaemonRunning({
@@ -349,6 +381,49 @@ var PtyDaemonClient = class extends EventEmitter {
 			session
 		}, reqOptions));
 	}
+	/**
+	* Acknowledge processed messages for flow control
+	* This helps the daemon track backpressure and prevent disconnections
+	*/
+	ack(session, count) {
+		this.notifyRaw({
+			type: "ack",
+			session,
+			count
+		});
+	}
+	/**
+	* Set the threshold for automatic ACKs (default: 100 messages)
+	* Set to 0 to disable automatic ACKs
+	*/
+	setAckThreshold(threshold) {
+		if (this.manualAckMode && threshold > 0) throw new Error("Cannot enable auto-ACK in manual ACK mode. Create client with manualAck: false");
+		this.ackThreshold = threshold;
+	}
+	/**
+	* Enable or disable manual ACK mode
+	*/
+	setManualAckMode(enabled) {
+		this.manualAckMode = enabled;
+		if (enabled) this.ackThreshold = 0;
+		else if (this.ackThreshold === 0) this.ackThreshold = 100;
+	}
+	/**
+	* Get current flow control configuration
+	*/
+	getFlowControlConfig() {
+		return {
+			ackThreshold: this.ackThreshold,
+			manualAckMode: this.manualAckMode,
+			pendingCounts: new Map(this.processedCounts)
+		};
+	}
+	/**
+	* Get pending message count for a specific session
+	*/
+	getPendingCount(sessionId) {
+		return this.processedCounts.get(sessionId) ?? 0;
+	}
 	unwrapOk(reply) {
 		if (reply.type === "error") throw new DaemonError(reply.code, reply.message);
 		if (reply.type !== "ok") throw new Error(`Expected ok, got ${reply.type}`);
@@ -413,13 +488,34 @@ var PtyDaemonClient = class extends EventEmitter {
 					this.pending.resolve(message);
 					continue;
 				}
-				if (isOutputEvent(message) || isExitEvent(message)) this.emit(message.type, message);
+				if (isOutputEvent(message)) {
+					this.emit(message.type, message);
+					if (this.ackThreshold > 0 && !this.manualAckMode) {
+						const session = message.session;
+						const count = (this.processedCounts.get(session) ?? 0) + 1;
+						this.processedCounts.set(session, count);
+						if (count >= this.ackThreshold) {
+							this.ack(session, count);
+							this.processedCounts.set(session, 0);
+						}
+					} else if (this.manualAckMode) {
+						const session = message.session;
+						const count = (this.processedCounts.get(session) ?? 0) + 1;
+						this.processedCounts.set(session, count);
+					}
+					continue;
+				}
+				if (isExitEvent(message)) {
+					this.emit(message.type, message);
+					this.processedCounts.delete(message.session);
+					continue;
+				}
+				if (isBackpressureWarningEvent(message)) this.emit("backpressure_warning", message);
 			}
 		} catch (err) {
-			if (err instanceof FrameParserError) {
-				this.emit("error", err);
-				this.close();
-			} else throw err;
+			const error = err instanceof FrameParserError ? err : err instanceof Error ? err : new Error(String(err));
+			this.emit("error", error);
+			this.close();
 		}
 	}
 	handleSocketError(err) {

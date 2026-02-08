@@ -104,7 +104,12 @@ type ClearScrollbackRequest = {
   type: "clear_scrollback";
   session: number;
 };
-type RequestMessage = HandshakeRequest | CreateRequest | ListRequest | AttachRequest | DetachRequest | KillRequest | KillAllRequest | InputRequest | ResizeRequest | SignalRequest | ClearScrollbackRequest;
+type AckRequest = {
+  type: "ack";
+  session: number;
+  count: number;
+};
+type RequestMessage = HandshakeRequest | CreateRequest | ListRequest | AttachRequest | DetachRequest | KillRequest | KillAllRequest | InputRequest | ResizeRequest | SignalRequest | ClearScrollbackRequest | AckRequest;
 type HandshakeResponse = {
   type: "handshake";
   seq: Seq;
@@ -126,6 +131,7 @@ type DaemonErrorResponse = {
   message: string;
 };
 type ReplyMessage = HandshakeResponse | DaemonOkResponse | DaemonErrorResponse;
+type BackpressureLevel = "green" | "yellow" | "red";
 type OutputEvent = {
   type: "output";
   session: number;
@@ -137,7 +143,20 @@ type ExitEvent = {
   code: number;
   signal?: number;
 };
-type EventMessage = OutputEvent | ExitEvent;
+type BackpressureWarningEvent = {
+  type: "backpressure_warning";
+  session: number;
+  queue_size: number;
+  level: BackpressureLevel;
+};
+type EventMessage = OutputEvent | ExitEvent | BackpressureWarningEvent;
+interface PtyDaemonClientEvents {
+  output: [OutputEvent];
+  exit: [ExitEvent];
+  backpressure_warning: [BackpressureWarningEvent];
+  error: [Error];
+  close: [];
+}
 type RequestOptions = {
   timeoutMs?: number;
 };
@@ -145,6 +164,19 @@ declare class DaemonError extends Error {
   readonly code: string;
   constructor(code: string, message: string);
 }
+type FlowControlOptions = {
+  /**
+   * Auto-ACK threshold (default: 100).
+   * Client will automatically acknowledge every N processed messages.
+   * Set to 0 to disable auto-ACK.
+   */
+  ackThreshold?: number;
+  /**
+   * Manual ACK mode. When true, disables auto-ACK and requires manual ACK calls.
+   * Use this for fine-grained flow control.
+   */
+  manualAck?: boolean;
+};
 type ClientOptions = {
   socketPath: string;
   token?: string;
@@ -153,8 +185,9 @@ type ClientOptions = {
   autoStart?: boolean;
   requestTimeoutMs?: number;
   daemon?: Omit<EnsureDaemonRunningOptions, "socketPath" | "tokenPath">;
+  flowControl?: FlowControlOptions;
 };
-declare class PtyDaemonClient extends EventEmitter {
+declare class PtyDaemonClient extends EventEmitter<PtyDaemonClientEvents> {
   private socket;
   private readonly parser;
   private readonly pending;
@@ -171,6 +204,9 @@ declare class PtyDaemonClient extends EventEmitter {
   private handshakePromise;
   private seq;
   private closed;
+  private processedCounts;
+  private ackThreshold;
+  private manualAckMode;
   constructor(options: ClientOptions);
   waitForConnection(): Promise<void>;
   close(): void;
@@ -195,6 +231,32 @@ declare class PtyDaemonClient extends EventEmitter {
   resize(session: number, cols: number, rows: number): void;
   signal(session: number, signal: string, reqOptions?: RequestOptions): Promise<void>;
   clearScrollback(session: number, reqOptions?: RequestOptions): Promise<void>;
+  /**
+   * Acknowledge processed messages for flow control
+   * This helps the daemon track backpressure and prevent disconnections
+   */
+  ack(session: number, count: number): void;
+  /**
+   * Set the threshold for automatic ACKs (default: 100 messages)
+   * Set to 0 to disable automatic ACKs
+   */
+  setAckThreshold(threshold: number): void;
+  /**
+   * Enable or disable manual ACK mode
+   */
+  setManualAckMode(enabled: boolean): void;
+  /**
+   * Get current flow control configuration
+   */
+  getFlowControlConfig(): {
+    ackThreshold: number;
+    manualAckMode: boolean;
+    pendingCounts: Map<number, number>;
+  };
+  /**
+   * Get pending message count for a specific session
+   */
+  getPendingCount(sessionId: number): number;
   private unwrapOk;
   private requireSession;
   private requireSessions;
@@ -268,5 +330,5 @@ declare class PendingRequests<TResponse extends SeqResponse = SeqResponse> {
   get size(): number;
 }
 //#endregion
-export { AttachRequest, ClearScrollbackRequest, ClientOptions, CreateOptions, CreatePtyOptions, CreateRequest, DEFAULT_MAX_BUFFER_SIZE, DEFAULT_MAX_FRAME_SIZE, DEFAULT_SOCKET_PATH, DEFAULT_TOKEN_PATH, DaemonError, DaemonErrorResponse, DaemonOkResponse, DetachRequest, EnsureDaemonRunningOptions, EventMessage, ExitEvent, FrameParser, FrameParserError, FrameParserOptions, HandshakeRequest, HandshakeResponse, InputRequest, KillAllRequest, KillRequest, ListRequest, OutputEvent, PendingEntry, PendingRequests, PtyDaemon, PtyDaemonClient, PtyInstance, ReplyMessage, RequestMessage, ResizeRequest, ResolveBinaryPathOptions, Seq, SeqResponse, SessionInfo, SignalRequest, Snapshot, TerminalModes, createClient, createPty, createPtyClient, encodeFrame, ensureDaemonRunning, isDaemonReady, resolveBinaryPath, stopDaemon };
+export { AckRequest, AttachRequest, BackpressureLevel, BackpressureWarningEvent, ClearScrollbackRequest, ClientOptions, CreateOptions, CreatePtyOptions, CreateRequest, DEFAULT_MAX_BUFFER_SIZE, DEFAULT_MAX_FRAME_SIZE, DEFAULT_SOCKET_PATH, DEFAULT_TOKEN_PATH, DaemonError, DaemonErrorResponse, DaemonOkResponse, DetachRequest, EnsureDaemonRunningOptions, EventMessage, ExitEvent, FlowControlOptions, FrameParser, FrameParserError, FrameParserOptions, HandshakeRequest, HandshakeResponse, InputRequest, KillAllRequest, KillRequest, ListRequest, OutputEvent, PendingEntry, PendingRequests, PtyDaemon, PtyDaemonClient, PtyDaemonClientEvents, PtyInstance, ReplyMessage, RequestMessage, ResizeRequest, ResolveBinaryPathOptions, Seq, SeqResponse, SessionInfo, SignalRequest, Snapshot, TerminalModes, createClient, createPty, createPtyClient, encodeFrame, ensureDaemonRunning, isDaemonReady, resolveBinaryPath, stopDaemon };
 //# sourceMappingURL=index.d.cts.map

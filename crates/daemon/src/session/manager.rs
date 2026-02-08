@@ -117,49 +117,6 @@ impl Manager {
         }
     }
 
-    /// Simplified broadcast with tokio channel backpressure
-    async fn broadcast_event(&self, session_id: u32, event: OutputEvent) {
-        let subs = self.session_subscribers.read().await;
-        let Some(list) = subs.get(&session_id) else {
-            return;
-        };
-
-        let cfg = config();
-
-        for sub in list {
-            match sub.tx.try_send(event.clone()) {
-                Ok(_) => {
-                    // Check if approaching threshold
-                    let remaining = sub.tx.capacity();
-                    if remaining < cfg.flow_threshold {
-                        let queue_size = cfg.flow_max_queue_size - remaining;
-                        let warning = OutputEvent::BackpressureWarning {
-                            session: session_id,
-                            queue_size,
-                            level: BackpressureLevel::Yellow,
-                        };
-                        let _ = sub.tx.try_send(warning);
-                    }
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    // Channel full - send red warning if configured
-                    if !cfg.flow_auto_disconnect {
-                        let warning = OutputEvent::BackpressureWarning {
-                            session: session_id,
-                            queue_size: cfg.flow_max_queue_size,
-                            level: BackpressureLevel::Red,
-                        };
-                        let _ = sub.tx.try_send(warning);
-                    }
-                    // If auto_disconnect is true, channel will be dropped
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    // Subscriber disconnected, will be cleaned up later
-                }
-            }
-        }
-    }
-
     /// Create a new PTY session
     pub async fn create(&self, opts: CreateOptions) -> Result<u32> {
         let cfg = config();
@@ -222,22 +179,31 @@ impl Manager {
     }
 
     pub async fn kill(&self, id: u32) -> Result<()> {
-        let sessions = self.sessions.read().await;
-        let session = sessions
+        let session = self.sessions
+            .read()
+            .await
             .get(&id)
+            .cloned()
             .ok_or_else(|| Error::NotFound(format!("session {}", id)))?;
 
         session.pty.send_signal(libc::SIGTERM)?;
+        self.finalize(id).await;
         Ok(())
     }
 
     pub async fn kill_all(&self) -> usize {
-        let sessions = self.sessions.read().await;
+        let sessions: Vec<(u32, Arc<Session>)> = self.sessions
+            .read()
+            .await
+            .iter()
+            .map(|(id, session)| (*id, session.clone()))
+            .collect();
         let mut count = 0;
 
-        for session in sessions.values() {
+        for (id, session) in sessions {
             if session.pty.send_signal(libc::SIGTERM).is_ok() {
                 count += 1;
+                self.finalize(id).await;
             }
         }
 
@@ -286,9 +252,6 @@ impl Manager {
 
         if let Some(sess) = session {
             sess.running.store(false, Ordering::SeqCst);
-
-            // Wait for child process (non-blocking check)
-            let _ = wait_for_child(sess.pty.child_pid);
         }
     }
 }
@@ -348,7 +311,7 @@ async fn start_reader(
     session.running.store(false, Ordering::SeqCst);
 
     // Get exit status
-    let (exit_code, exit_signal) = wait_for_child(session.pty.child_pid);
+    let (exit_code, exit_signal) = wait_for_child(session.pty.child_pid).await;
 
     // Send exit event
     let exit_event = OutputEvent::Exit {
@@ -382,7 +345,7 @@ async fn broadcast_to_subscribers(
             Ok(_) => {
                 let remaining = sub.tx.capacity();
                 if remaining < cfg.flow_threshold {
-                    let queue_size = cfg.flow_max_queue_size - remaining;
+                    let queue_size = cfg.flow_max_queue_size.saturating_sub(remaining);
                     let warning = OutputEvent::BackpressureWarning {
                         session: session_id,
                         queue_size,
@@ -426,28 +389,28 @@ fn parse_signal(name: &str) -> Result<i32> {
     }
 }
 
-/// Wait for child process to exit (non-blocking)
-fn wait_for_child(pid: i32) -> (i32, Option<i32>) {
-    use rustix::process::{waitpid, WaitOptions};
-    use rustix::process::Pid;
+/// Wait for child process to exit and return its real exit status.
+async fn wait_for_child(pid: i32) -> (i32, Option<i32>) {
+    tokio::task::spawn_blocking(move || wait_for_child_blocking(pid))
+        .await
+        .unwrap_or((0, None))
+}
 
-    let pid = unsafe { Pid::from_raw_unchecked(pid) };
+fn wait_for_child_blocking(pid: i32) -> (i32, Option<i32>) {
+    let mut status: libc::c_int = 0;
+    let result = unsafe { libc::waitpid(pid, &mut status as *mut libc::c_int, 0) };
 
-    // Try non-blocking wait
-    match waitpid(Some(pid), WaitOptions::NOHANG) {
-        Ok(Some(status)) => {
-            if status.exited() {
-                let code = status.exit_status().unwrap_or(0);
-                (code as i32, None)
-            } else if status.signaled() {
-                // Get signal from status - rustix doesn't have .signal() method
-                // Approximate with SIGTERM as default
-                let sig = 15; // SIGTERM
-                (128 + sig, Some(sig))
-            } else {
-                (0, None)
-            }
-        }
-        _ => (0, None),
+    if result < 0 {
+        return (0, None);
+    }
+
+    if libc::WIFEXITED(status) {
+        let code = libc::WEXITSTATUS(status) as i32;
+        (code, None)
+    } else if libc::WIFSIGNALED(status) {
+        let sig = libc::WTERMSIG(status) as i32;
+        (128 + sig, Some(sig))
+    } else {
+        (0, None)
     }
 }

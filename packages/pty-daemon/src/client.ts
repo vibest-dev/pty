@@ -617,12 +617,14 @@ export class PtyDaemonClient extends EventEmitter<PtyDaemonClientEvents> {
         }
       }
     } catch (err) {
-      if (err instanceof FrameParserError) {
-        this.emit("error", err);
-        this.close();
-      } else {
-        throw err;
-      }
+      const error =
+        err instanceof FrameParserError
+          ? err
+          : err instanceof Error
+            ? err
+            : new Error(String(err));
+      this.emit("error", error);
+      this.close();
     }
   }
 
