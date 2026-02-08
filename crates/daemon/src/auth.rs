@@ -34,6 +34,10 @@ fn get_token() -> Result<&'static str> {
 
 fn load_or_create() -> Result<String> {
     let path = &config().token_path;
+    if let Some(parent) = Path::new(path).parent() {
+        fs::create_dir_all(parent)?;
+        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+    }
 
     // Try existing token
     if Path::new(path).exists() {

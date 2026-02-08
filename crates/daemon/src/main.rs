@@ -9,6 +9,7 @@ use config::config;
 use server::handle_connection;
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -113,6 +114,11 @@ async fn main() {
 }
 
 fn prepare_socket(path: &str) -> std::io::Result<()> {
+    if let Some(parent) = Path::new(path).parent() {
+        fs::create_dir_all(parent)?;
+        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+    }
+
     match fs::metadata(path) {
         Ok(meta) => {
             if meta.file_type().is_socket() {

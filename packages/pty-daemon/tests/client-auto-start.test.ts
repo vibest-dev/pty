@@ -1,84 +1,68 @@
 import fs from "node:fs";
-import os from "node:os";
+import net from "node:net";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createClient } from "../src/client";
+import { createPtyClient } from "../src/client";
+import { FrameParser, encodeFrame } from "../src/frame";
 
-type Cleanup = () => Promise<void> | void;
-const cleanups: Cleanup[] = [];
+const sockets: string[] = [];
 
-afterEach(async () => {
-  while (cleanups.length > 0) {
-    const cleanup = cleanups.pop();
-    if (cleanup) {
-      await cleanup();
+afterEach(() => {
+  for (const socketPath of sockets.splice(0)) {
+    try {
+      fs.unlinkSync(socketPath);
+    } catch {
+      // no-op
     }
   }
 });
 
-function tempDir(): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pty-client-test-"));
-  cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
-  return dir;
+function nextSocketPath(): string {
+  const name = `ptyc-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`;
+  const socketPath = path.join("/tmp", name);
+  sockets.push(socketPath);
+  return socketPath;
 }
 
-describe("PtyDaemonClient autoStart", () => {
-  it("starts daemon automatically and performs handshake", async () => {
-    const dir = tempDir();
-    const socketPath = path.join(dir, "daemon.sock");
-    const tokenPath = path.join(dir, "daemon.token");
-    const scriptPath = path.join(dir, "fake-daemon.cjs");
+describe("PtyDaemonClient connection mode", () => {
+  it("connects to an existing daemon", async () => {
+    const socketPath = nextSocketPath();
+    const parser = new FrameParser();
 
-    const msgpackPath = require.resolve("@msgpack/msgpack");
-    fs.writeFileSync(
-      scriptPath,
-      [
-        "#!/usr/bin/env node",
-        "const fs = require('node:fs');",
-        "const net = require('node:net');",
-        `const { decode, encode } = require(${JSON.stringify(msgpackPath)});`,
-        "const socketPath = process.env.RUST_PTY_SOCKET_PATH;",
-        "const tokenPath = process.env.RUST_PTY_TOKEN_PATH;",
-        "try { fs.unlinkSync(socketPath); } catch {}",
-        "fs.writeFileSync(tokenPath, 'token-auto\\n', 'utf8');",
-        "function encodeFrame(msg) {",
-        "  const payload = encode(msg);",
-        "  const frame = new Uint8Array(4 + payload.length);",
-        "  const view = new DataView(frame.buffer);",
-        "  view.setUint32(0, payload.length, false);",
-        "  frame.set(payload, 4);",
-        "  return Buffer.from(frame);",
-        "}",
-        "const server = net.createServer((socket) => {",
-        "  socket.on('data', (chunk) => {",
-        "    const len = chunk.readUInt32BE(0);",
-        "    const payload = chunk.slice(4, 4 + len);",
-        "    const msg = decode(payload);",
-        "    socket.write(encodeFrame({",
-        "      type: 'handshake',",
-        "      seq: msg.seq,",
-        "      protocol_version: 1,",
-        "      daemon_version: 'fake',",
-        "      daemon_pid: 1,",
-        "    }));",
-        "  });",
-        "});",
-        "server.listen(socketPath);",
-        "process.on('SIGTERM', () => server.close(() => process.exit(0)));",
-        "setInterval(() => {}, 1000);",
-      ].join("\n"),
-      "utf8"
-    );
-    fs.chmodSync(scriptPath, 0o755);
+    const server = net.createServer((socket) => {
+      socket.on("data", (chunk) => {
+        const messages = parser.push(new Uint8Array(chunk));
+        for (const message of messages) {
+          if (!message || typeof message !== "object") {
+            continue;
+          }
+          const frame = message as Record<string, unknown>;
+          if (frame.type !== "handshake" || typeof frame.seq !== "number") {
+            continue;
+          }
+          socket.write(
+            Buffer.from(
+              encodeFrame({
+                type: "handshake",
+                seq: frame.seq,
+                protocol_version: 1,
+                daemon_version: "existing",
+                daemon_pid: 1,
+              }),
+            ),
+          );
+        }
+      });
+    });
 
-    const client = createClient({
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(socketPath, resolve);
+    });
+
+    const client = createPtyClient({
       socketPath,
-      tokenPath,
-      autoStart: true,
-      daemon: {
-        binaryPath: scriptPath,
-        timeoutMs: 3000,
-      },
+      token: "token-1",
       protocolVersion: 1,
     });
 
@@ -86,8 +70,9 @@ describe("PtyDaemonClient autoStart", () => {
     const handshake = await client.handshake();
 
     expect(handshake.type).toBe("handshake");
-    expect(handshake.daemon_version).toBe("fake");
+    expect(handshake.daemon_version).toBe("existing");
 
-    await client.shutdown();
+    client.close();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 });

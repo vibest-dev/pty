@@ -8,10 +8,9 @@
  * in the PR description.
  */
 
-import { PtyDaemonClient, createClient } from "../packages/pty-daemon/src/client";
+import { createPtyClient } from "../packages/pty-daemon/src/client";
 import { spawn, type ChildProcess } from "node:child_process";
 import { unlink, writeFile } from "node:fs/promises";
-import { randomBytes } from "node:crypto";
 
 interface BenchmarkResult {
   zone: "green" | "yellow" | "red";
@@ -100,11 +99,9 @@ class FlowControlBenchmark {
   }
 
   async runBenchmark(config: BenchmarkConfig, targetZone: "green" | "yellow" | "red"): Promise<BenchmarkResult> {
-    const client = createClient({
+    const client = createPtyClient({
       socketPath: this.socketPath,
       tokenPath: this.tokenPath,
-      autoStart: false,
-      flowControl: { manualAck: true } // Manual control for precise testing
     });
 
     await client.waitForConnection();
@@ -132,23 +129,14 @@ class FlowControlBenchmark {
     client.on("backpressure_warning", (event) => {
       stats.backpressureEvents++;
       currentZone = event.level;
-
-      // Only ACK if we're not trying to stay in a specific zone
-      if (targetZone === "green" || (targetZone === "yellow" && event.level === "red")) {
-        // ACK some messages to control zone
-        const ackCount = Math.min(100, client.getPendingCount(session.session));
-        if (ackCount > 0) {
-          client.ack(session.session, ackCount);
-        }
-      }
     });
 
     // Attach and start generating output
-    await client.attach(session.session);
+    await client.attach({ id: session.session });
 
     // Generate appropriate load for target zone
     const outputCommand = this.getOutputCommand(config, targetZone);
-    client.write(session.session, new TextEncoder().encode(outputCommand + "\n"));
+    client.write({ id: session.session }, new TextEncoder().encode(outputCommand + "\n"));
 
     // Let the test run for the specified duration
     const endTime = Date.now() + config.testDurationMs;
@@ -164,7 +152,7 @@ class FlowControlBenchmark {
 
       // Send more commands if needed
       if (Date.now() % 5000 < 100) { // Every 5 seconds
-        client.write(session.session, new TextEncoder().encode("echo 'continue'\n"));
+        client.write({ id: session.session }, new TextEncoder().encode("echo 'continue'\n"));
         stats.messagesSent++;
       }
     }

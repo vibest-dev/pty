@@ -2,8 +2,9 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { decode, encode } from "@msgpack/msgpack";
 import { afterEach, describe, expect, it } from "vitest";
-import { FrameParser, createClient, encodeFrame } from "../dist/index.mjs";
+import { createPtyClient } from "../dist/index.mjs";
 
 type RequestMessage = {
   type: string;
@@ -38,14 +39,35 @@ function isRequestMessage(value: unknown): value is RequestMessage {
   return typeof candidate.type === "string" && typeof candidate.seq === "number";
 }
 
+function encodeFrame(message: unknown): Uint8Array {
+  const payload = encode(message);
+  const frame = new Uint8Array(4 + payload.length);
+  const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
+  view.setUint32(0, payload.length, false);
+  frame.set(payload, 4);
+  return frame;
+}
+
 describe("built dist runtime parity", () => {
-  it("supports flow-control API and emits backpressure warning events", async () => {
+  it("emits backpressure warning events", async () => {
     const socketPath = nextSocketPath();
-    const parser = new FrameParser();
+    let buffer = Buffer.alloc(0);
 
     const server = net.createServer((socket) => {
       socket.on("data", (chunk) => {
-        const messages = parser.push(new Uint8Array(chunk));
+        buffer = Buffer.concat([buffer, chunk]);
+        const messages: unknown[] = [];
+
+        while (buffer.length >= 4) {
+          const len = buffer.readUInt32BE(0);
+          if (len <= 0 || buffer.length < 4 + len) {
+            break;
+          }
+          const payload = buffer.subarray(4, 4 + len);
+          messages.push(decode(payload));
+          buffer = buffer.subarray(4 + len);
+        }
+
         for (const message of messages) {
           if (!isRequestMessage(message)) {
             continue;
@@ -86,14 +108,12 @@ describe("built dist runtime parity", () => {
       server.listen(socketPath, resolve);
     });
 
-    const client = createClient({
+    const client = createPtyClient({
       socketPath,
       token: "token-1",
       protocolVersion: 1,
       requestTimeoutMs: 200,
     });
-
-    expect(typeof client.getFlowControlConfig).toBe("function");
 
     const warningPromise = new Promise<{ level: string; session: number; queue_size: number }>(
       (resolve, reject) => {
