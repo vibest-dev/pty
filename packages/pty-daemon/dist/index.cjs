@@ -66,35 +66,10 @@ function resolveBinaryPath(options = {}) {
 function isDaemonReady(socketPath, tokenPath) {
 	return node_fs.default.existsSync(socketPath) && node_fs.default.existsSync(tokenPath);
 }
-async function canConnectUnixSocket(socketPath, timeoutMs = 150) {
-	return await new Promise((resolve) => {
-		const socket = node_net.default.createConnection(socketPath);
-		let settled = false;
-		const done = (value) => {
-			if (settled) return;
-			settled = true;
-			socket.destroy();
-			resolve(value);
-		};
-		const timer = setTimeout(() => done(false), timeoutMs);
-		socket.once("connect", () => {
-			clearTimeout(timer);
-			done(true);
-		});
-		socket.once("error", () => {
-			clearTimeout(timer);
-			done(false);
-		});
-	});
-}
-async function isDaemonReachable(socketPath, tokenPath) {
-	if (!isDaemonReady(socketPath, tokenPath)) return false;
-	return await canConnectUnixSocket(socketPath);
-}
 async function waitForDaemonReady(child, socketPath, tokenPath, timeoutMs) {
 	const startedAt = Date.now();
 	while (Date.now() - startedAt < timeoutMs) {
-		if (await isDaemonReachable(socketPath, tokenPath)) return;
+		if (isDaemonReady(socketPath, tokenPath)) return;
 		if (child.exitCode !== null) throw new Error(`daemon exited early with code ${child.exitCode}`);
 		await sleep(25);
 	}
@@ -103,13 +78,7 @@ async function waitForDaemonReady(child, socketPath, tokenPath, timeoutMs) {
 async function ensureDaemonRunning(options = {}) {
 	const socketPath = options.socketPath ?? DEFAULT_SOCKET_PATH;
 	const tokenPath = options.tokenPath ?? DEFAULT_TOKEN_PATH;
-	if (await isDaemonReachable(socketPath, tokenPath)) return null;
-	if (node_fs.default.existsSync(socketPath)) try {
-		node_fs.default.unlinkSync(socketPath);
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		throw new Error(`cannot remove stale socket at ${socketPath}: ${message}`);
-	}
+	if (node_fs.default.existsSync(socketPath)) return null;
 	const env = {
 		...process.env,
 		...options.env,
@@ -444,7 +413,8 @@ var PtyDaemonClient = class extends node_events.EventEmitter {
 		}, reqOptions));
 	}
 	/**
-	* Send protocol-level ACK (currently compatibility/no-op on daemon side).
+	* Acknowledge processed messages for flow control
+	* This helps the daemon track backpressure and prevent disconnections
 	*/
 	ack(session, count) {
 		this.notifyRaw({
@@ -454,11 +424,11 @@ var PtyDaemonClient = class extends node_events.EventEmitter {
 		});
 	}
 	/**
-	* Set local counter reset threshold (default: 100 messages).
-	* Set to 0 to disable automatic local reset.
+	* Set the threshold for automatic ACKs (default: 100 messages)
+	* Set to 0 to disable automatic ACKs
 	*/
 	setAckThreshold(threshold) {
-		if (this.manualAckMode && threshold > 0) throw new Error("Cannot enable auto-reset in manual ACK mode. Create client with manualAck: false");
+		if (this.manualAckMode && threshold > 0) throw new Error("Cannot enable auto-ACK in manual ACK mode. Create client with manualAck: false");
 		this.ackThreshold = threshold;
 	}
 	/**
@@ -551,10 +521,19 @@ var PtyDaemonClient = class extends node_events.EventEmitter {
 				}
 				if (isOutputEvent(message)) {
 					this.emit(message.type, message);
-					const session = message.session;
-					const count = (this.processedCounts.get(session) ?? 0) + 1;
-					if (!this.manualAckMode && this.ackThreshold > 0 && count >= this.ackThreshold) this.processedCounts.set(session, 0);
-					else this.processedCounts.set(session, count);
+					if (this.ackThreshold > 0 && !this.manualAckMode) {
+						const session = message.session;
+						const count = (this.processedCounts.get(session) ?? 0) + 1;
+						this.processedCounts.set(session, count);
+						if (count >= this.ackThreshold) {
+							this.ack(session, count);
+							this.processedCounts.set(session, 0);
+						}
+					} else if (this.manualAckMode) {
+						const session = message.session;
+						const count = (this.processedCounts.get(session) ?? 0) + 1;
+						this.processedCounts.set(session, count);
+					}
 					continue;
 				}
 				if (isExitEvent(message)) {
