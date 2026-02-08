@@ -221,6 +221,35 @@ impl TestClient {
         from_slice(&payload).unwrap()
     }
 
+    fn recv_with_timeout(&mut self, timeout: Duration) -> Option<Response> {
+        self.stream.set_read_timeout(Some(timeout)).unwrap();
+
+        let result: std::io::Result<Response> = (|| -> std::io::Result<Response> {
+            let mut len_buf = [0u8; 4];
+            self.stream.read_exact(&mut len_buf)?;
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; len];
+            self.stream.read_exact(&mut payload)?;
+            Ok(from_slice(&payload).unwrap())
+        })();
+
+        // Restore the default timeout used by all existing integration tests.
+        self.stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+
+        match result {
+            Ok(response) => Some(response),
+            Err(err)
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                None
+            }
+            Err(err) => panic!("Failed to read response: {}", err),
+        }
+    }
+
     fn authenticate(&mut self) {
         let token = fs::read_to_string(&self.token_path)
             .expect("Cannot read token")
@@ -381,6 +410,27 @@ mod integration_tests {
     }
 
     #[test]
+    fn test_create_rejects_zero_dimensions() {
+        let daemon = TestDaemon::start();
+        let mut client = daemon.client();
+        client.authenticate();
+
+        client.send(&Request::Create {
+            cwd: None,
+            cols: Some(0),
+            rows: Some(24),
+            initial_commands: None,
+        });
+
+        match client.recv() {
+            Response::Error { code, .. } => {
+                assert_eq!(code, "INVALID_ARGUMENT");
+            }
+            resp => panic!("Expected Error, got {:?}", resp),
+        }
+    }
+
+    #[test]
     fn test_list_sessions() {
         let daemon = TestDaemon::start();
         let mut client = daemon.client();
@@ -459,6 +509,45 @@ mod integration_tests {
                 assert!(sessions.unwrap().is_empty());
             }
             _ => panic!("List failed"),
+        }
+    }
+
+    #[test]
+    fn test_kill_emits_exit_event_for_attached_client() {
+        let daemon = TestDaemon::start();
+        let mut client = daemon.client();
+        client.authenticate();
+
+        client.send(&Request::Create {
+            cwd: None,
+            cols: Some(80),
+            rows: Some(24),
+            initial_commands: None,
+        });
+        let session_id = match client.recv() {
+            Response::Ok { session, .. } => session.expect("session id"),
+            resp => panic!("Create failed: {:?}", resp),
+        };
+
+        client.send(&Request::Attach {
+            session: session_id,
+        });
+        match client.recv() {
+            Response::Ok { session, .. } => assert_eq!(session, Some(session_id)),
+            resp => panic!("Attach failed: {:?}", resp),
+        }
+
+        client.send(&Request::Kill {
+            session: session_id,
+        });
+        match client.recv() {
+            Response::Ok { session, .. } => assert_eq!(session, Some(session_id)),
+            resp => panic!("Kill failed: {:?}", resp),
+        }
+
+        match client.recv_with_timeout(Duration::from_secs(2)) {
+            Some(Response::Exit { session, .. }) => assert_eq!(session, session_id),
+            other => panic!("Expected Exit event after kill, got {:?}", other),
         }
     }
 

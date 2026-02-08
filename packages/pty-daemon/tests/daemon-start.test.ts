@@ -70,4 +70,55 @@ describe("ensureDaemonRunning", () => {
     expect(fs.existsSync(socketPath)).toBe(true);
     expect(fs.existsSync(tokenPath)).toBe(true);
   });
+
+  it("replaces stale socket path and starts daemon", async () => {
+    const dir = makeTempDir();
+    const socketPath = path.join(dir, "daemon.sock");
+    const tokenPath = path.join(dir, "daemon.token");
+    const binaryPath = path.join(dir, "fake-daemon.cjs");
+
+    // Simulate a stale socket path from a crashed daemon.
+    fs.writeFileSync(socketPath, "stale", "utf8");
+    fs.writeFileSync(tokenPath, "stale-token\n", "utf8");
+
+    fs.writeFileSync(
+      binaryPath,
+      [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        "const net = require('node:net');",
+        "const socketPath = process.env.RUST_PTY_SOCKET_PATH;",
+        "const tokenPath = process.env.RUST_PTY_TOKEN_PATH;",
+        "try { fs.unlinkSync(socketPath); } catch {}",
+        "fs.writeFileSync(tokenPath, 'token-fresh\\n', 'utf8');",
+        "const server = net.createServer(() => {});",
+        "server.listen(socketPath);",
+        "process.on('SIGTERM', () => server.close(() => process.exit(0)));",
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+      "utf8",
+    );
+    fs.chmodSync(binaryPath, 0o755);
+
+    const child = await ensureDaemonRunning({
+      binaryPath,
+      socketPath,
+      tokenPath,
+      timeoutMs: 3000,
+    });
+
+    cleanups.push(async () => {
+      await stopDaemon(child);
+      try {
+        fs.unlinkSync(socketPath);
+      } catch {}
+      try {
+        fs.unlinkSync(tokenPath);
+      } catch {}
+    });
+
+    expect(child).not.toBeNull();
+    expect(child?.pid).toBeTypeOf("number");
+    expect(fs.readFileSync(tokenPath, "utf8")).toContain("token-fresh");
+  });
 });

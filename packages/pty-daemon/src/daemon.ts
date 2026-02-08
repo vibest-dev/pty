@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -56,6 +57,39 @@ export function isDaemonReady(socketPath: string, tokenPath: string): boolean {
   return fs.existsSync(socketPath) && fs.existsSync(tokenPath);
 }
 
+async function canConnectUnixSocket(socketPath: string, timeoutMs = 150): Promise<boolean> {
+  return await new Promise<boolean>((resolve) => {
+    const socket = net.createConnection(socketPath);
+    let settled = false;
+
+    const done = (value: boolean): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      socket.destroy();
+      resolve(value);
+    };
+
+    const timer = setTimeout(() => done(false), timeoutMs);
+    socket.once("connect", () => {
+      clearTimeout(timer);
+      done(true);
+    });
+    socket.once("error", () => {
+      clearTimeout(timer);
+      done(false);
+    });
+  });
+}
+
+async function isDaemonReachable(socketPath: string, tokenPath: string): Promise<boolean> {
+  if (!isDaemonReady(socketPath, tokenPath)) {
+    return false;
+  }
+  return await canConnectUnixSocket(socketPath);
+}
+
 async function waitForDaemonReady(
   child: ChildProcess,
   socketPath: string,
@@ -64,7 +98,7 @@ async function waitForDaemonReady(
 ): Promise<void> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
-    if (isDaemonReady(socketPath, tokenPath)) {
+    if (await isDaemonReachable(socketPath, tokenPath)) {
       return;
     }
 
@@ -84,8 +118,18 @@ export async function ensureDaemonRunning(
   const socketPath = options.socketPath ?? DEFAULT_SOCKET_PATH;
   const tokenPath = options.tokenPath ?? DEFAULT_TOKEN_PATH;
 
-  if (fs.existsSync(socketPath)) {
+  if (await isDaemonReachable(socketPath, tokenPath)) {
     return null;
+  }
+
+  if (fs.existsSync(socketPath)) {
+    // Stale socket path left by a crashed daemon (or invalid file at socket path).
+    try {
+      fs.unlinkSync(socketPath);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`cannot remove stale socket at ${socketPath}: ${message}`);
+    }
   }
 
   const env = {

@@ -5,7 +5,7 @@ use crate::protocol::{BackpressureLevel, CreateOptions, SessionInfo, Snapshot};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub static MANAGER: OnceLock<Manager> = OnceLock::new();
 
@@ -132,6 +132,7 @@ impl Manager {
         let cwd = opts.cwd.as_deref().unwrap_or(".");
         let cols = opts.cols.unwrap_or(80);
         let rows = opts.rows.unwrap_or(24);
+        validate_terminal_size(cols, rows)?;
 
         let pty = PtyHandle::spawn(
             cwd,
@@ -185,10 +186,7 @@ impl Manager {
             .get(&id)
             .cloned()
             .ok_or_else(|| Error::NotFound(format!("session {}", id)))?;
-
-        session.pty.send_signal(libc::SIGTERM)?;
-        self.finalize(id).await;
-        Ok(())
+        self.terminate_and_finalize(id, session).await
     }
 
     pub async fn kill_all(&self) -> usize {
@@ -201,9 +199,8 @@ impl Manager {
         let mut count = 0;
 
         for (id, session) in sessions {
-            if session.pty.send_signal(libc::SIGTERM).is_ok() {
+            if self.terminate_and_finalize(id, session).await.is_ok() {
                 count += 1;
-                self.finalize(id).await;
             }
         }
 
@@ -222,6 +219,8 @@ impl Manager {
     }
 
     pub async fn resize(&self, id: u32, cols: u16, rows: u16) -> Result<()> {
+        validate_terminal_size(cols, rows)?;
+
         let sessions = self.sessions.read().await;
         let session = sessions
             .get(&id)
@@ -253,6 +252,32 @@ impl Manager {
         if let Some(sess) = session {
             sess.running.store(false, Ordering::SeqCst);
         }
+    }
+
+    async fn terminate_and_finalize(&self, id: u32, session: Arc<Session>) -> Result<()> {
+        // `kill` should be definitive: use SIGKILL to avoid lingering sessions.
+        session.pty.send_signal(libc::SIGKILL)?;
+
+        let (exit_code, exit_signal) = wait_for_child_with_timeout(
+            session.pty.child_pid,
+            Duration::from_millis(250),
+        )
+        .await
+        .unwrap_or((128 + libc::SIGKILL, Some(libc::SIGKILL)));
+
+        broadcast_to_subscribers(
+            &self.session_subscribers,
+            id,
+            OutputEvent::Exit {
+                session: id,
+                code: exit_code,
+                signal: exit_signal,
+            },
+        )
+        .await;
+
+        self.finalize(id).await;
+        Ok(())
     }
 }
 
@@ -396,6 +421,33 @@ async fn wait_for_child(pid: i32) -> (i32, Option<i32>) {
         .unwrap_or((0, None))
 }
 
+async fn wait_for_child_with_timeout(pid: i32, timeout: Duration) -> Option<(i32, Option<i32>)> {
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        if let Some(status) = try_wait_for_child(pid) {
+            return Some(status);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn try_wait_for_child(pid: i32) -> Option<(i32, Option<i32>)> {
+    let mut status: libc::c_int = 0;
+    let result = unsafe { libc::waitpid(pid, &mut status as *mut libc::c_int, libc::WNOHANG) };
+
+    if result == 0 {
+        return None;
+    }
+    if result < 0 {
+        return Some((0, None));
+    }
+    Some(decode_wait_status(status))
+}
+
 fn wait_for_child_blocking(pid: i32) -> (i32, Option<i32>) {
     let mut status: libc::c_int = 0;
     let result = unsafe { libc::waitpid(pid, &mut status as *mut libc::c_int, 0) };
@@ -404,13 +456,26 @@ fn wait_for_child_blocking(pid: i32) -> (i32, Option<i32>) {
         return (0, None);
     }
 
+    decode_wait_status(status)
+}
+
+fn decode_wait_status(status: libc::c_int) -> (i32, Option<i32>) {
     if libc::WIFEXITED(status) {
         let code = libc::WEXITSTATUS(status) as i32;
-        (code, None)
-    } else if libc::WIFSIGNALED(status) {
-        let sig = libc::WTERMSIG(status) as i32;
-        (128 + sig, Some(sig))
-    } else {
-        (0, None)
+        return (code, None);
     }
+    if libc::WIFSIGNALED(status) {
+        let sig = libc::WTERMSIG(status) as i32;
+        return (128 + sig, Some(sig));
+    }
+    (0, None)
+}
+
+fn validate_terminal_size(cols: u16, rows: u16) -> Result<()> {
+    if cols == 0 || rows == 0 {
+        return Err(Error::InvalidArgument(
+            "terminal size must have cols > 0 and rows > 0".into(),
+        ));
+    }
+    Ok(())
 }
