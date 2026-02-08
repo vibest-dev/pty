@@ -136,6 +136,15 @@ export type BackpressureWarningEvent = {
 };
 export type EventMessage = OutputEvent | ExitEvent | BackpressureWarningEvent;
 
+// Type-safe event map for the client EventEmitter
+export interface PtyDaemonClientEvents {
+  output: [OutputEvent];
+  exit: [ExitEvent];
+  backpressure_warning: [BackpressureWarningEvent];
+  error: [Error];
+  close: [];
+}
+
 type RequestOptions = {
   timeoutMs?: number;
 };
@@ -230,6 +239,21 @@ export class DaemonError extends Error {
 // Client
 // ---------------------------------------------------------------------------
 
+export type FlowControlOptions = {
+  /**
+   * Auto-ACK threshold (default: 100).
+   * Client will automatically acknowledge every N processed messages.
+   * Set to 0 to disable auto-ACK.
+   */
+  ackThreshold?: number;
+
+  /**
+   * Manual ACK mode. When true, disables auto-ACK and requires manual ACK calls.
+   * Use this for fine-grained flow control.
+   */
+  manualAck?: boolean;
+};
+
 export type ClientOptions = {
   socketPath: string;
   token?: string;
@@ -238,9 +262,10 @@ export type ClientOptions = {
   autoStart?: boolean;
   requestTimeoutMs?: number;
   daemon?: Omit<EnsureDaemonRunningOptions, "socketPath" | "tokenPath">;
+  flowControl?: FlowControlOptions;
 };
 
-export class PtyDaemonClient extends EventEmitter {
+export class PtyDaemonClient extends EventEmitter<PtyDaemonClientEvents> {
   private socket: net.Socket | null = null;
   private readonly parser = new FrameParser();
   private readonly pending = new PendingRequests<ReplyMessage>();
@@ -259,6 +284,7 @@ export class PtyDaemonClient extends EventEmitter {
   private closed = false;
   private processedCounts: Map<number, number> = new Map();
   private ackThreshold = 100;
+  private manualAckMode = false;
 
   constructor(options: ClientOptions) {
     super();
@@ -269,6 +295,15 @@ export class PtyDaemonClient extends EventEmitter {
     this.autoStart = options.autoStart ?? true;
     this.requestTimeoutMs = options.requestTimeoutMs;
     this.daemonOptions = options.daemon ?? {};
+
+    // Flow control configuration
+    const flowControl = options.flowControl ?? {};
+    this.ackThreshold = flowControl.ackThreshold ?? 100;
+    this.manualAckMode = flowControl.manualAck ?? false;
+
+    if (this.manualAckMode) {
+      this.ackThreshold = 0; // Disable auto-ACK in manual mode
+    }
   }
 
   // ---- Connection lifecycle ------------------------------------------------
@@ -430,7 +465,40 @@ export class PtyDaemonClient extends EventEmitter {
    * Set to 0 to disable automatic ACKs
    */
   setAckThreshold(threshold: number): void {
+    if (this.manualAckMode && threshold > 0) {
+      throw new Error("Cannot enable auto-ACK in manual ACK mode. Create client with manualAck: false");
+    }
     this.ackThreshold = threshold;
+  }
+
+  /**
+   * Enable or disable manual ACK mode
+   */
+  setManualAckMode(enabled: boolean): void {
+    this.manualAckMode = enabled;
+    if (enabled) {
+      this.ackThreshold = 0; // Disable auto-ACK
+    } else if (this.ackThreshold === 0) {
+      this.ackThreshold = 100; // Restore default
+    }
+  }
+
+  /**
+   * Get current flow control configuration
+   */
+  getFlowControlConfig(): { ackThreshold: number; manualAckMode: boolean; pendingCounts: Map<number, number> } {
+    return {
+      ackThreshold: this.ackThreshold,
+      manualAckMode: this.manualAckMode,
+      pendingCounts: new Map(this.processedCounts)
+    };
+  }
+
+  /**
+   * Get pending message count for a specific session
+   */
+  getPendingCount(sessionId: number): number {
+    return this.processedCounts.get(sessionId) ?? 0;
   }
 
   // ---- Internal helpers ----------------------------------------------------
@@ -519,8 +587,8 @@ export class PtyDaemonClient extends EventEmitter {
 
         if (isOutputEvent(message)) {
           this.emit(message.type, message);
-          // Auto-ACK if enabled
-          if (this.ackThreshold > 0) {
+          // Auto-ACK if enabled and not in manual mode
+          if (this.ackThreshold > 0 && !this.manualAckMode) {
             const session = message.session;
             const count = (this.processedCounts.get(session) ?? 0) + 1;
             this.processedCounts.set(session, count);
@@ -528,6 +596,11 @@ export class PtyDaemonClient extends EventEmitter {
               this.ack(session, count);
               this.processedCounts.set(session, 0);
             }
+          } else if (this.manualAckMode) {
+            // In manual mode, just track the count but don't auto-ACK
+            const session = message.session;
+            const count = (this.processedCounts.get(session) ?? 0) + 1;
+            this.processedCounts.set(session, count);
           }
           continue;
         }

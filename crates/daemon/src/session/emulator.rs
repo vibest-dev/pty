@@ -126,7 +126,7 @@ impl Emulator {
         }
     }
 
-    fn process_byte(&mut self, byte: u8) {
+    pub fn process_byte(&mut self, byte: u8) {
         match &self.escape_state {
             EscapeState::Normal => self.process_normal(byte),
             EscapeState::Escape => self.process_escape(byte),

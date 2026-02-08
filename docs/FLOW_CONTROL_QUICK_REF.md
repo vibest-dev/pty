@@ -18,6 +18,7 @@ The PTY daemon implements a three-tier watermark system to handle slow subscribe
 # Thresholds (messages)
 RUST_PTY_FLOW_YELLOW_THRESHOLD=1024    # Green → Yellow
 RUST_PTY_FLOW_RED_THRESHOLD=4096       # Yellow → Red
+RUST_PTY_FLOW_MAX_QUEUE_SIZE=65536     # Hard limit (force disconnect)
 
 # Rate limits (milliseconds)
 RUST_PTY_FLOW_YELLOW_INTERVAL_MS=10    # Yellow zone delay
