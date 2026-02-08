@@ -11,7 +11,7 @@
  * 验证是否存在队头阻塞或公平性问题
  */
 
-import { createClient } from "../packages/pty-daemon/src/client";
+import { createPtyClient } from "../packages/pty-daemon/src/client";
 
 interface SessionStats {
   id: number;
@@ -23,7 +23,10 @@ interface SessionStats {
 }
 
 async function testMultiSessionThroughput() {
-  const client = createClient({ socketPath: "/tmp/rust-pty.sock" });
+  const client = createPtyClient({
+    socketPath: "/tmp/rust-pty.sock",
+    tokenPath: "/tmp/rust-pty.token",
+  });
 
   console.log("Connecting to daemon...");
   await client.waitForConnection();
@@ -31,37 +34,37 @@ async function testMultiSessionThroughput() {
   // 创建 3 个会话
   console.log("\nCreating sessions...");
 
-  const session1 = await client.createSession({
+  const session1 = await client.create({
     shell: "/bin/bash",
     cols: 80,
     rows: 24,
   });
-  console.log(`✓ Session 1 (high-freq): ${session1.id}`);
+  console.log(`✓ Session 1 (high-freq): ${session1.session}`);
 
-  const session2 = await client.createSession({
+  const session2 = await client.create({
     shell: "/bin/bash",
     cols: 80,
     rows: 24,
   });
-  console.log(`✓ Session 2 (low-freq):  ${session2.id}`);
+  console.log(`✓ Session 2 (low-freq):  ${session2.session}`);
 
-  const session3 = await client.createSession({
+  const session3 = await client.create({
     shell: "/bin/bash",
     cols: 80,
     rows: 24,
   });
-  console.log(`✓ Session 3 (mid-freq):  ${session3.id}`);
+  console.log(`✓ Session 3 (mid-freq):  ${session3.session}`);
 
   // 附加到所有会话
-  await client.attachSession(session1.id);
-  await client.attachSession(session2.id);
-  await client.attachSession(session3.id);
+  await client.attach({ id: session1.session });
+  await client.attach({ id: session2.session });
+  await client.attach({ id: session3.session });
 
   // 统计数据
   const stats: Map<number, SessionStats> = new Map([
-    [session1.id, { id: session1.id, name: "high-freq", messageCount: 0, firstMessage: null, lastMessage: null, latencies: [] }],
-    [session2.id, { id: session2.id, name: "low-freq", messageCount: 0, firstMessage: null, lastMessage: null, latencies: [] }],
-    [session3.id, { id: session3.id, name: "mid-freq", messageCount: 0, firstMessage: null, lastMessage: null, latencies: [] }],
+    [session1.session, { id: session1.session, name: "high-freq", messageCount: 0, firstMessage: null, lastMessage: null, latencies: [] }],
+    [session2.session, { id: session2.session, name: "low-freq", messageCount: 0, firstMessage: null, lastMessage: null, latencies: [] }],
+    [session3.session, { id: session3.session, name: "mid-freq", messageCount: 0, firstMessage: null, lastMessage: null, latencies: [] }],
   ]);
 
   let backpressureWarnings = 0;
@@ -93,22 +96,25 @@ async function testMultiSessionThroughput() {
   startTime = Date.now();
 
   // 会话 1: 高频输出
-  client.sendInput(session1.id, "yes 'DATA-SESSION-1' | head -1000\n");
+  client.write({ id: session1.session }, new TextEncoder().encode("yes 'DATA-SESSION-1' | head -1000\n"));
 
   // 会话 2: 低频交互（手动输入）
-  setTimeout(() => client.sendInput(session2.id, "echo 'test from session 2'\n"), 1000);
-  setTimeout(() => client.sendInput(session2.id, "echo 'another message'\n"), 3000);
-  setTimeout(() => client.sendInput(session2.id, "echo 'final message'\n"), 5000);
+  setTimeout(() => client.write({ id: session2.session }, new TextEncoder().encode("echo 'test from session 2'\n")), 1000);
+  setTimeout(() => client.write({ id: session2.session }, new TextEncoder().encode("echo 'another message'\n")), 3000);
+  setTimeout(() => client.write({ id: session2.session }, new TextEncoder().encode("echo 'final message'\n")), 5000);
 
   // 会话 3: 中频输出
-  client.sendInput(session3.id, "for i in {1..100}; do echo \"Message $i from session 3\"; sleep 0.1; done\n");
+  client.write(
+    { id: session3.session },
+    new TextEncoder().encode("for i in {1..100}; do echo \"Message $i from session 3\"; sleep 0.1; done\n"),
+  );
 
   // 等待 10 秒
   await new Promise(resolve => setTimeout(resolve, 10000));
 
   // 停止高频会话
-  client.sendInput(session1.id, "\x03"); // Ctrl+C
-  client.sendInput(session3.id, "\x03");
+  client.write({ id: session1.session }, new TextEncoder().encode("\x03")); // Ctrl+C
+  client.write({ id: session3.session }, new TextEncoder().encode("\x03"));
 
   // 等待最后的输出
   await new Promise(resolve => setTimeout(resolve, 1000));
@@ -148,9 +154,9 @@ async function testMultiSessionThroughput() {
 
   // 清理
   console.log("\n🧹 Cleaning up...");
-  await client.killSession(session1.id);
-  await client.killSession(session2.id);
-  await client.killSession(session3.id);
+  await client.kill(session1.session);
+  await client.kill(session2.session);
+  await client.kill(session3.session);
 
   console.log("✅ Test complete!");
   process.exit(0);

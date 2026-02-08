@@ -1,6 +1,19 @@
 {
   "name": "@vibest/pty-daemon",
-  "version": "0.1.0",
+  "version": "0.2.0",
+  "description": "TypeScript SDK client for the vibest PTY daemon",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vibest/pty-daemon"
+  },
+  "keywords": [
+    "pty",
+    "terminal",
+    "daemon",
+    "sdk",
+    "typescript"
+  ],
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.mjs",
@@ -19,13 +32,21 @@
   },
   "files": [
     "dist",
-    "bin",
-    "postinstall.mjs"
+    "README.md"
   ],
   "scripts": {
     "build": "tsdown",
     "test:sdk": "bun run build && vitest --run tests",
-    "test": "bun run build && vitest --run"
+    "test": "bun run build && vitest --run",
+    "publish:sdk:dry": "npm publish --dry-run --access public",
+    "publish:sdk": "npm publish --access public",
+    "prepublishOnly": "bun run test:sdk"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "dependencies": {
     "@msgpack/msgpack": "^3.0.0"

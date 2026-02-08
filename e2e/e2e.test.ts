@@ -8,10 +8,12 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from "bun:test"
 import { mkdtempSync, rmSync } from "node:fs";
 import path from "node:path";
 import {
-  createClient,
+  createPtyClient,
   DaemonError,
   type PtyDaemonClient,
 } from "@vibest/pty-daemon";
+import type { ChildProcess } from "node:child_process";
+import { ensureDaemonRunning, stopDaemon } from "../packages/pty-daemon/src/daemon";
 
 const BINARY_PATH = path.resolve(import.meta.dir, "..", "target", "release", "vibest-pty-daemon");
 const PROTOCOL_VERSION = 1;
@@ -20,13 +22,13 @@ let tempDir = "";
 let socketPath = "";
 let tokenPath = "";
 let daemonClient: PtyDaemonClient | null = null;
+let daemonProcess: ChildProcess | null = null;
 
 async function createAuthedClient(): Promise<PtyDaemonClient> {
-  const client = createClient({
+  const client = createPtyClient({
     socketPath,
     tokenPath,
     protocolVersion: PROTOCOL_VERSION,
-    autoStart: false,
   });
 
   await client.waitForConnection();
@@ -43,15 +45,17 @@ describe("PTY Daemon E2E via SDK", () => {
     socketPath = path.join(tempDir, "daemon.sock");
     tokenPath = path.join(tempDir, "daemon.token");
 
-    daemonClient = createClient({
+    daemonProcess = await ensureDaemonRunning({
+      socketPath,
+      tokenPath,
+      binaryPath: BINARY_PATH,
+      timeoutMs: 5000,
+    });
+
+    daemonClient = createPtyClient({
       socketPath,
       tokenPath,
       protocolVersion: PROTOCOL_VERSION,
-      autoStart: true,
-      daemon: {
-        binaryPath: BINARY_PATH,
-        timeoutMs: 5000,
-      },
     });
 
     await daemonClient.waitForConnection();
@@ -70,9 +74,11 @@ describe("PTY Daemon E2E via SDK", () => {
 
   afterAll(async () => {
     if (daemonClient) {
-      await daemonClient.shutdown();
+      daemonClient.close();
       daemonClient = null;
     }
+    await stopDaemon(daemonProcess);
+    daemonProcess = null;
 
     if (tempDir) {
       rmSync(tempDir, { recursive: true, force: true });
@@ -96,7 +102,7 @@ describe("PTY Daemon E2E via SDK", () => {
       const createdSession = sessions.find((session) => session.id === sessionId);
       expect(createdSession).toBeTruthy();
 
-      const attached = await client.attach(sessionId);
+      const attached = await client.attach({ id: sessionId });
       const snapshot = attached.snapshot;
       expect(snapshot.cols).toBe(80);
       expect(snapshot.rows).toBe(24);
@@ -137,10 +143,9 @@ describe("PTY Daemon E2E via SDK", () => {
   });
 
   it("surfaces auth/protocol handshake errors via SDK handshake", async () => {
-    const invalidTokenClient = createClient({
+    const invalidTokenClient = createPtyClient({
       socketPath,
       token: "invalid-token",
-      autoStart: false,
       protocolVersion: PROTOCOL_VERSION,
     });
     try {
@@ -155,10 +160,9 @@ describe("PTY Daemon E2E via SDK", () => {
       invalidTokenClient.close();
     }
 
-    const protocolMismatchClient = createClient({
+    const protocolMismatchClient = createPtyClient({
       socketPath,
       tokenPath,
-      autoStart: false,
       protocolVersion: 999,
     });
     try {

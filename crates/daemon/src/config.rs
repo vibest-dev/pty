@@ -14,13 +14,20 @@ pub struct Config {
     pub flow_auto_disconnect: bool,     // Disconnect on full (default false)
 }
 
+fn default_base_dir() -> String {
+    std::env::var("HOME")
+        .map(|home| format!("{}/.vibest/pty", home))
+        .unwrap_or_else(|_| "/tmp/.vibest/pty".into())
+}
+
 impl Config {
     fn from_env() -> Self {
+        let base_dir = default_base_dir();
         let socket_path = std::env::var("RUST_PTY_SOCKET_PATH")
-            .unwrap_or_else(|_| "/tmp/rust-pty.sock".into());
+            .unwrap_or_else(|_| format!("{}/socket", base_dir));
 
         let token_path = std::env::var("RUST_PTY_TOKEN_PATH")
-            .unwrap_or_else(|_| "/tmp/rust-pty.token".into());
+            .unwrap_or_else(|_| format!("{}/token", base_dir));
 
         let pid_path = format!(
             "{}.pid",

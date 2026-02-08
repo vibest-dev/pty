@@ -1,13 +1,7 @@
 import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
 import net from "node:net";
-import type { ChildProcess } from "node:child_process";
-import {
-  DEFAULT_TOKEN_PATH,
-  ensureDaemonRunning,
-  stopDaemon,
-  type EnsureDaemonRunningOptions,
-} from "./daemon";
+import { DEFAULT_SOCKET_PATH, DEFAULT_TOKEN_PATH } from "./daemon";
 import { FrameParser, FrameParserError, encodeFrame } from "./frame";
 import { PendingRequests } from "./pending";
 
@@ -55,6 +49,10 @@ export type CreateOptions = {
   initial_commands?: string[];
 };
 
+export type Session = {
+  id: number;
+};
+
 // ---------------------------------------------------------------------------
 // Request / Response discriminated unions
 // ---------------------------------------------------------------------------
@@ -77,7 +75,6 @@ export type InputRequest = { type: "input"; session: number; data: Uint8Array };
 export type ResizeRequest = { type: "resize"; session: number; cols: number; rows: number };
 export type SignalRequest = { type: "signal"; session: number; signal: string };
 export type ClearScrollbackRequest = { type: "clear_scrollback"; session: number };
-export type AckRequest = { type: "ack"; session: number; count: number };
 
 export type RequestMessage =
   | HandshakeRequest
@@ -90,8 +87,7 @@ export type RequestMessage =
   | InputRequest
   | ResizeRequest
   | SignalRequest
-  | ClearScrollbackRequest
-  | AckRequest;
+  | ClearScrollbackRequest;
 
 type RequestNoSeq = RequestMessage;
 
@@ -239,31 +235,12 @@ export class DaemonError extends Error {
 // Client
 // ---------------------------------------------------------------------------
 
-export type FlowControlOptions = {
-  /**
-   * Local flow-control counter threshold (default: 100).
-   * When reached, the local processed counter is reset to 0.
-   * Set to 0 to keep an ever-growing processed counter.
-   */
-  ackThreshold?: number;
-
-  /**
-   * Manual ACK mode.
-   * When true, local counters never auto-reset.
-   * Use with explicit `ack()` calls if you need protocol-level compatibility behavior.
-   */
-  manualAck?: boolean;
-};
-
 export type ClientOptions = {
-  socketPath: string;
+  socketPath?: string;
   token?: string;
   tokenPath?: string;
   protocolVersion?: number;
-  autoStart?: boolean;
   requestTimeoutMs?: number;
-  daemon?: Omit<EnsureDaemonRunningOptions, "socketPath" | "tokenPath">;
-  flowControl?: FlowControlOptions;
 };
 
 export class PtyDaemonClient extends EventEmitter<PtyDaemonClientEvents> {
@@ -274,50 +251,32 @@ export class PtyDaemonClient extends EventEmitter<PtyDaemonClientEvents> {
   private token?: string;
   private readonly tokenPath: string;
   private readonly protocolVersion: number;
-  private readonly autoStart: boolean;
   private readonly requestTimeoutMs?: number;
-  private readonly daemonOptions: Omit<EnsureDaemonRunningOptions, "socketPath" | "tokenPath">;
-  private startedDaemon: ChildProcess | null = null;
   private pendingHandshakeSeq: Seq | null = null;
   private handshakeResponse: HandshakeResponse | null = null;
   private handshakePromise: Promise<HandshakeResponse> | null = null;
   private seq = 1;
   private closed = false;
-  private processedCounts: Map<number, number> = new Map();
-  private ackThreshold = 100;
-  private manualAckMode = false;
+
+  readonly session = {
+    create: async (options: CreateOptions, reqOptions?: RequestOptions): Promise<Session> => {
+      const created = await this.create(options, reqOptions);
+      return { id: created.session };
+    },
+  };
 
   constructor(options: ClientOptions) {
     super();
-    this.socketPath = options.socketPath;
+    this.socketPath = options.socketPath ?? DEFAULT_SOCKET_PATH;
     this.token = options.token;
     this.tokenPath = options.tokenPath ?? DEFAULT_TOKEN_PATH;
     this.protocolVersion = options.protocolVersion ?? 1;
-    this.autoStart = options.autoStart ?? true;
     this.requestTimeoutMs = options.requestTimeoutMs;
-    this.daemonOptions = options.daemon ?? {};
-
-    // Flow control configuration
-    const flowControl = options.flowControl ?? {};
-    this.ackThreshold = flowControl.ackThreshold ?? 100;
-    this.manualAckMode = flowControl.manualAck ?? false;
-
-    if (this.manualAckMode) {
-      this.ackThreshold = 0; // Disable local auto-reset in manual mode
-    }
   }
 
   // ---- Connection lifecycle ------------------------------------------------
 
   async waitForConnection(): Promise<void> {
-    if (this.autoStart) {
-      this.startedDaemon = await ensureDaemonRunning({
-        ...this.daemonOptions,
-        socketPath: this.socketPath,
-        tokenPath: this.tokenPath,
-      });
-    }
-
     await new Promise<void>((resolve, reject) => {
       const socket = net.createConnection(this.socketPath, () => {
         this.socket = socket;
@@ -349,18 +308,8 @@ export class PtyDaemonClient extends EventEmitter<PtyDaemonClientEvents> {
     this.socket = null;
   }
 
-  async shutdown(): Promise<void> {
-    this.close();
-    await stopDaemon(this.startedDaemon);
-    this.startedDaemon = null;
-  }
-
   get isConnected(): boolean {
     return this.socket !== null && !this.closed;
-  }
-
-  get daemonProcess(): ChildProcess | null {
-    return this.startedDaemon;
   }
 
   // ---- Typed public API ----------------------------------------------------
@@ -409,11 +358,19 @@ export class PtyDaemonClient extends EventEmitter<PtyDaemonClientEvents> {
   }
 
   async attach(
-    session: number,
+    session: Session,
     reqOptions?: RequestOptions,
   ): Promise<{ session: number; snapshot: Snapshot }> {
-    const ok = this.unwrapOk(await this.requestRaw({ type: "attach", session }, reqOptions));
+    const ok = this.unwrapOk(await this.requestRaw({ type: "attach", session: session.id }, reqOptions));
     return { session: this.requireSession(ok), snapshot: this.requireSnapshot(ok) };
+  }
+
+  async createAndAttach(
+    options: CreateOptions,
+    reqOptions?: RequestOptions,
+  ): Promise<{ session: number; snapshot: Snapshot }> {
+    const session = await this.session.create(options, reqOptions);
+    return await this.attach(session, reqOptions);
   }
 
   async detach(session: number, reqOptions?: RequestOptions): Promise<void> {
@@ -429,16 +386,12 @@ export class PtyDaemonClient extends EventEmitter<PtyDaemonClientEvents> {
     return this.requireSession(ok);
   }
 
-  input(session: number, data: Uint8Array): void {
-    this.notifyRaw({ type: "input", session, data });
+  write(session: Session, data: Uint8Array): void {
+    this.notifyRaw({ type: "input", session: session.id, data });
   }
 
-  write(session: number, data: Uint8Array): void {
-    this.input(session, data);
-  }
-
-  resize(session: number, cols: number, rows: number): void {
-    this.notifyRaw({ type: "resize", session, cols, rows });
+  resize(session: Session, cols: number, rows: number): void {
+    this.notifyRaw({ type: "resize", session: session.id, cols, rows });
   }
 
   async signal(
@@ -451,54 +404,6 @@ export class PtyDaemonClient extends EventEmitter<PtyDaemonClientEvents> {
 
   async clearScrollback(session: number, reqOptions?: RequestOptions): Promise<void> {
     this.unwrapOk(await this.requestRaw({ type: "clear_scrollback", session }, reqOptions));
-  }
-
-  /**
-   * Send protocol-level ACK (currently compatibility/no-op on daemon side).
-   */
-  ack(session: number, count: number): void {
-    this.notifyRaw({ type: "ack", session, count });
-  }
-
-  /**
-   * Set local counter reset threshold (default: 100 messages).
-   * Set to 0 to disable automatic local reset.
-   */
-  setAckThreshold(threshold: number): void {
-    if (this.manualAckMode && threshold > 0) {
-      throw new Error("Cannot enable auto-reset in manual ACK mode. Create client with manualAck: false");
-    }
-    this.ackThreshold = threshold;
-  }
-
-  /**
-   * Enable or disable manual ACK mode
-   */
-  setManualAckMode(enabled: boolean): void {
-    this.manualAckMode = enabled;
-    if (enabled) {
-      this.ackThreshold = 0; // Disable local auto-reset
-    } else if (this.ackThreshold === 0) {
-      this.ackThreshold = 100; // Restore default
-    }
-  }
-
-  /**
-   * Get current flow control configuration
-   */
-  getFlowControlConfig(): { ackThreshold: number; manualAckMode: boolean; pendingCounts: Map<number, number> } {
-    return {
-      ackThreshold: this.ackThreshold,
-      manualAckMode: this.manualAckMode,
-      pendingCounts: new Map(this.processedCounts)
-    };
-  }
-
-  /**
-   * Get pending message count for a specific session
-   */
-  getPendingCount(sessionId: number): number {
-    return this.processedCounts.get(sessionId) ?? 0;
   }
 
   // ---- Internal helpers ----------------------------------------------------
@@ -587,22 +492,11 @@ export class PtyDaemonClient extends EventEmitter<PtyDaemonClientEvents> {
 
         if (isOutputEvent(message)) {
           this.emit(message.type, message);
-          const session = message.session;
-          const count = (this.processedCounts.get(session) ?? 0) + 1;
-
-          if (!this.manualAckMode && this.ackThreshold > 0 && count >= this.ackThreshold) {
-            // Local counter reset only. Daemon-side ACK is compatibility-only today.
-            this.processedCounts.set(session, 0);
-          } else {
-            this.processedCounts.set(session, count);
-          }
           continue;
         }
 
         if (isExitEvent(message)) {
           this.emit(message.type, message);
-          // Clean up processed counts for this session
-          this.processedCounts.delete(message.session);
           continue;
         }
 
@@ -659,6 +553,6 @@ export class PtyDaemonClient extends EventEmitter<PtyDaemonClientEvents> {
   }
 }
 
-export function createClient(options: ClientOptions): PtyDaemonClient {
+export function createPtyClient(options: ClientOptions): PtyDaemonClient {
   return new PtyDaemonClient(options);
 }

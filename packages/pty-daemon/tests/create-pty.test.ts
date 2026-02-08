@@ -1,13 +1,16 @@
 import fs from "node:fs";
 import net from "node:net";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createPty, createPtyClient } from "../src";
+import { stopDaemon } from "../src/daemon";
 import { FrameParser, encodeFrame } from "../src/frame";
 
 type Cleanup = () => Promise<void> | void;
 const cleanups: Cleanup[] = [];
+const require = createRequire(import.meta.url);
 
 afterEach(async () => {
   while (cleanups.length > 0) {
@@ -18,20 +21,57 @@ afterEach(async () => {
   }
 });
 
-function tempDir(): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pty-create-test-"));
+function nextSocketPath(): string {
+  const socketPath = path.join(
+    os.tmpdir(),
+    `pty-create-test-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+  );
+  cleanups.push(() => {
+    try {
+      fs.unlinkSync(socketPath);
+    } catch {
+      // no-op
+    }
+  });
+  return socketPath;
+}
+
+function nextTempDir(prefix = "pty-create-test-"): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
   return dir;
 }
 
+async function waitFor(
+  predicate: () => boolean,
+  options: {
+    timeoutMs?: number;
+    intervalMs?: number;
+    errorMessage?: string;
+  } = {},
+): Promise<void> {
+  const timeoutMs = options.timeoutMs ?? 1500;
+  const intervalMs = options.intervalMs ?? 25;
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+
+  throw new Error(options.errorMessage ?? "waitFor timeout");
+}
+
 describe("createPty", () => {
-  it("returns connected client and daemon when autoStart is true", async () => {
-    const dir = tempDir();
+  it("prewarms daemon in background and connects on daemon.connect", async () => {
+    const dir = nextTempDir("pty-create-daemon-");
     const socketPath = path.join(dir, "daemon.sock");
     const tokenPath = path.join(dir, "daemon.token");
     const scriptPath = path.join(dir, "fake-daemon.cjs");
-
     const msgpackPath = require.resolve("@msgpack/msgpack");
+
     fs.writeFileSync(
       scriptPath,
       [
@@ -73,38 +113,46 @@ describe("createPty", () => {
     );
     fs.chmodSync(scriptPath, 0o755);
 
-    const pty = await createPty({
-      socketPath,
-      tokenPath,
-      autoStart: true,
-      daemon: {
-        binaryPath: scriptPath,
-        timeoutMs: 3000,
-      },
-      protocolVersion: 1,
-    });
-    cleanups.push(() => pty.shutdown());
-
-    expect(pty.client.isConnected).toBe(true);
-    expect(pty.daemon.process?.pid).toBeTypeOf("number");
-    expect(pty.daemon.socketPath).toBe(socketPath);
-    expect(pty.daemon.tokenPath).toBe(tokenPath);
-    expect((await pty.client.handshake()).type).toBe("handshake");
-  });
-
-  it("returns daemon=null when autoStart is false", async () => {
-    const socketPath = path.join(
-      os.tmpdir(),
-      `pty-create-test-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
-    );
+    const prevDaemonPath = process.env.PTY_DAEMON_PATH;
+    process.env.PTY_DAEMON_PATH = scriptPath;
     cleanups.push(() => {
-      try {
-        fs.unlinkSync(socketPath);
-      } catch {
-        // no-op
+      if (typeof prevDaemonPath === "undefined") {
+        delete process.env.PTY_DAEMON_PATH;
+      } else {
+        process.env.PTY_DAEMON_PATH = prevDaemonPath;
       }
     });
 
+    const pty = createPty({
+      socketPath,
+      tokenPath,
+      protocolVersion: 1,
+    });
+
+    expect(pty.client.isConnected).toBe(false);
+    await waitFor(() => pty.daemon.process !== null, {
+      timeoutMs: 3000,
+      errorMessage: "expected daemon process to be prewarmed in background",
+    });
+    expect(pty.daemon.process?.pid).toBeTypeOf("number");
+
+    await expect(pty.daemon.connect()).resolves.toBeUndefined();
+
+    cleanups.push(async () => {
+      pty.client.close();
+      await stopDaemon(pty.daemon.process);
+    });
+
+    expect(pty.client.isConnected).toBe(true);
+    expect((await pty.client.handshake()).daemon_version).toBe("fake");
+    await expect(pty.daemon.connect()).resolves.toBeUndefined();
+  });
+
+  it("connects to an existing daemon without spawning new process", async () => {
+    const dir = nextTempDir("pty-create-existing-");
+    const socketPath = path.join(dir, "daemon.sock");
+    const tokenPath = path.join(dir, "daemon.token");
+    fs.writeFileSync(tokenPath, "token-existing\n", "utf8");
     const parser = new FrameParser();
     const server = net.createServer((socket) => {
       socket.on("data", (chunk) => {
@@ -138,16 +186,44 @@ describe("createPty", () => {
     });
     cleanups.push(() => new Promise<void>((resolve) => server.close(() => resolve())));
 
-    const pty = await createPty({
+    const pty = createPty({
       socketPath,
+      tokenPath,
       token: "token-manual",
-      autoStart: false,
       protocolVersion: 1,
     });
-    cleanups.push(() => pty.shutdown());
+
+    expect(pty.client.isConnected).toBe(false);
+    expect(pty.daemon.process).toBeNull();
+    expect(pty.daemon.socketPath).toBe(socketPath);
+
+    await expect(pty.daemon.connect()).resolves.toBeUndefined();
+    cleanups.push(() => pty.client.close());
 
     expect(pty.client.isConnected).toBe(true);
-    expect(pty.daemon.process).toBeNull();
+    expect((await pty.client.handshake()).type).toBe("handshake");
+  });
+
+  it("surfaces daemon bootstrap failures via daemon.connect", async () => {
+    const dir = nextTempDir("pty-create-no-ensure-");
+    const socketPath = path.join(dir, "daemon.sock");
+    const tokenPath = path.join(dir, "daemon.token");
+    const failingBinaryPath = path.join(dir, "failing-daemon.sh");
+    fs.writeFileSync(failingBinaryPath, "#!/bin/sh\nexit 1\n", "utf8");
+    fs.chmodSync(failingBinaryPath, 0o755);
+
+    const pty = createPty({
+      socketPath,
+      tokenPath,
+      daemon: {
+        binaryPath: failingBinaryPath,
+      },
+      protocolVersion: 1,
+    });
+    cleanups.push(() => pty.client.close());
+
+    expect(pty.client.isConnected).toBe(false);
+    await expect(pty.daemon.connect()).rejects.toThrow(/daemon exited early|startup timeout/i);
   });
 });
 
@@ -155,7 +231,6 @@ describe("createPtyClient", () => {
   it("creates client instance without connecting", () => {
     const client = createPtyClient({
       socketPath: "/tmp/does-not-matter.sock",
-      autoStart: false,
     });
 
     expect(client.isConnected).toBe(false);

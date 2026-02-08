@@ -1,11 +1,14 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const DEFAULT_SOCKET_PATH = "/tmp/rust-pty.sock";
-export const DEFAULT_TOKEN_PATH = "/tmp/rust-pty.token";
+const DEFAULT_BASE_DIR = path.join(process.env.HOME ?? os.homedir() ?? "/tmp", ".vibest", "pty");
+
+export const DEFAULT_SOCKET_PATH = path.join(DEFAULT_BASE_DIR, "socket");
+export const DEFAULT_TOKEN_PATH = path.join(DEFAULT_BASE_DIR, "token");
 
 export type ResolveBinaryPathOptions = {
   env?: Record<string, string | undefined>;
@@ -35,6 +38,11 @@ function isExecutableFile(candidate: string): boolean {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function ensureParentDir(filePath: string): void {
+  const dir = path.dirname(filePath);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 }
 
 export function resolveBinaryPath(options: ResolveBinaryPathOptions = {}): string | null {
@@ -117,6 +125,9 @@ export async function ensureDaemonRunning(
 ): Promise<ChildProcess | null> {
   const socketPath = options.socketPath ?? DEFAULT_SOCKET_PATH;
   const tokenPath = options.tokenPath ?? DEFAULT_TOKEN_PATH;
+
+  ensureParentDir(socketPath);
+  ensureParentDir(tokenPath);
 
   if (await isDaemonReachable(socketPath, tokenPath)) {
     return null;

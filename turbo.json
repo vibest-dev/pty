@@ -18,6 +18,14 @@
     "test:e2e": {
       "dependsOn": ["^build", "vibest-pty-daemon#build"],
       "cache": false
+    },
+    "publish:sdk": {
+      "dependsOn": ["build"],
+      "cache": false
+    },
+    "publish:sdk:dry": {
+      "dependsOn": ["build"],
+      "cache": false
     }
   }
 }
