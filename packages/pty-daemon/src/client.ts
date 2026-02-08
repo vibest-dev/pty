@@ -241,15 +241,16 @@ export class DaemonError extends Error {
 
 export type FlowControlOptions = {
   /**
-   * Auto-ACK threshold (default: 100).
-   * Client will automatically acknowledge every N processed messages.
-   * Set to 0 to disable auto-ACK.
+   * Local flow-control counter threshold (default: 100).
+   * When reached, the local processed counter is reset to 0.
+   * Set to 0 to keep an ever-growing processed counter.
    */
   ackThreshold?: number;
 
   /**
-   * Manual ACK mode. When true, disables auto-ACK and requires manual ACK calls.
-   * Use this for fine-grained flow control.
+   * Manual ACK mode.
+   * When true, local counters never auto-reset.
+   * Use with explicit `ack()` calls if you need protocol-level compatibility behavior.
    */
   manualAck?: boolean;
 };
@@ -302,7 +303,7 @@ export class PtyDaemonClient extends EventEmitter<PtyDaemonClientEvents> {
     this.manualAckMode = flowControl.manualAck ?? false;
 
     if (this.manualAckMode) {
-      this.ackThreshold = 0; // Disable auto-ACK in manual mode
+      this.ackThreshold = 0; // Disable local auto-reset in manual mode
     }
   }
 
@@ -453,20 +454,19 @@ export class PtyDaemonClient extends EventEmitter<PtyDaemonClientEvents> {
   }
 
   /**
-   * Acknowledge processed messages for flow control
-   * This helps the daemon track backpressure and prevent disconnections
+   * Send protocol-level ACK (currently compatibility/no-op on daemon side).
    */
   ack(session: number, count: number): void {
     this.notifyRaw({ type: "ack", session, count });
   }
 
   /**
-   * Set the threshold for automatic ACKs (default: 100 messages)
-   * Set to 0 to disable automatic ACKs
+   * Set local counter reset threshold (default: 100 messages).
+   * Set to 0 to disable automatic local reset.
    */
   setAckThreshold(threshold: number): void {
     if (this.manualAckMode && threshold > 0) {
-      throw new Error("Cannot enable auto-ACK in manual ACK mode. Create client with manualAck: false");
+      throw new Error("Cannot enable auto-reset in manual ACK mode. Create client with manualAck: false");
     }
     this.ackThreshold = threshold;
   }
@@ -477,7 +477,7 @@ export class PtyDaemonClient extends EventEmitter<PtyDaemonClientEvents> {
   setManualAckMode(enabled: boolean): void {
     this.manualAckMode = enabled;
     if (enabled) {
-      this.ackThreshold = 0; // Disable auto-ACK
+      this.ackThreshold = 0; // Disable local auto-reset
     } else if (this.ackThreshold === 0) {
       this.ackThreshold = 100; // Restore default
     }
@@ -587,19 +587,13 @@ export class PtyDaemonClient extends EventEmitter<PtyDaemonClientEvents> {
 
         if (isOutputEvent(message)) {
           this.emit(message.type, message);
-          // Auto-ACK if enabled and not in manual mode
-          if (this.ackThreshold > 0 && !this.manualAckMode) {
-            const session = message.session;
-            const count = (this.processedCounts.get(session) ?? 0) + 1;
-            this.processedCounts.set(session, count);
-            if (count >= this.ackThreshold) {
-              this.ack(session, count);
-              this.processedCounts.set(session, 0);
-            }
-          } else if (this.manualAckMode) {
-            // In manual mode, just track the count but don't auto-ACK
-            const session = message.session;
-            const count = (this.processedCounts.get(session) ?? 0) + 1;
+          const session = message.session;
+          const count = (this.processedCounts.get(session) ?? 0) + 1;
+
+          if (!this.manualAckMode && this.ackThreshold > 0 && count >= this.ackThreshold) {
+            // Local counter reset only. Daemon-side ACK is compatibility-only today.
+            this.processedCounts.set(session, 0);
+          } else {
             this.processedCounts.set(session, count);
           }
           continue;

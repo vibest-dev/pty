@@ -93,13 +93,10 @@ async fn cleanup(state: &mut ClientState) {
 }
 
 async fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Option<Response> {
-    println!("[handler] Received request: {:?}", req);
-
     // Require authentication first
     if !state.authenticated {
         return match req {
             Request::Handshake { token, protocol_version } => {
-                println!("[handler] Handshake: protocol_version={}, token_len={}", protocol_version, token.len());
                 if protocol_version != PROTOCOL_VERSION {
                     return Some(Response::error(
                         seq,
@@ -112,11 +109,9 @@ async fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Opti
                 }
 
                 if !auth::validate(&token) {
-                    println!("[handler] Auth failed for token");
                     return Some(Response::error(seq, "AUTH_FAILED", "Invalid token"));
                 }
 
-                println!("[handler] Auth succeeded");
                 state.authenticated = true;
 
                 Some(Response::Handshake {
