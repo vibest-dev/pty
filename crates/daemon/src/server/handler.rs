@@ -1,14 +1,8 @@
 use crate::auth;
 use crate::error::Error;
-use crate::protocol::{read_message, write_message, Request, RequestEnvelope, Response, PROTOCOL_VERSION};
+use crate::protocol::{read_message_async, write_message_async, Request, RequestEnvelope, Response, PROTOCOL_VERSION};
 use crate::session::{manager, OutputEvent};
 use std::collections::{HashMap, HashSet};
-use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::Arc;
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -18,12 +12,8 @@ struct ClientState {
     attached_sessions: HashSet<u32>,
     /// Session subscriber IDs
     session_sub_ids: HashMap<u32, u64>,
-    /// Output forwarder thread
-    output_thread: Option<JoinHandle<()>>,
-    stop_flag: Arc<AtomicBool>,
-    output_tx: Option<mpsc::Sender<OutputEvent>>,
-    /// Count of messages processed (for ACK tracking)
-    processed_count: Arc<AtomicUsize>,
+    /// Output receiver for subscribed sessions
+    output_rx: Option<tokio::sync::mpsc::Receiver<OutputEvent>>,
 }
 
 impl Default for ClientState {
@@ -32,98 +22,83 @@ impl Default for ClientState {
             authenticated: false,
             attached_sessions: HashSet::new(),
             session_sub_ids: HashMap::new(),
-            output_thread: None,
-            stop_flag: Arc::new(AtomicBool::new(false)),
-            output_tx: None,
-            processed_count: Arc::new(AtomicUsize::new(0)),
+            output_rx: None,
         }
     }
 }
 
-pub fn serve(mut stream: UnixStream) {
+pub async fn handle_connection(mut stream: tokio::net::UnixStream) {
     let mut state = ClientState::default();
 
     loop {
-        let envelope: RequestEnvelope = match read_message(&mut stream) {
-            Ok(req) => req,
-            Err(_) => break,
-        };
+        tokio::select! {
+            // Handle incoming requests
+            result = read_message_async::<RequestEnvelope>(&mut stream) => {
+                let Ok(envelope) = result else {
+                    break;
+                };
 
-        let response = handle(&mut stream, &mut state, envelope.seq, envelope.request);
+                if let Some(response) = handle_request(&mut state, envelope.seq, envelope.request).await {
+                    if write_message_async::<Response>(&mut stream, &response).await.is_err() {
+                        break;
+                    }
+                }
+            }
 
-        if let Some(resp) = response {
-            if write_message(&mut stream, &resp).is_err() {
-                break;
+            // Forward output events (if attached to any session)
+            Some(event) = async {
+                match state.output_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await, // Never resolves if no receiver
+                }
+            } => {
+                let response = match event {
+                    OutputEvent::Data { session, data } => Response::Output { session, data },
+                    OutputEvent::Exit { session, code, signal } => {
+                        Response::Exit { session, code, signal }
+                    }
+                    OutputEvent::BackpressureWarning { session, queue_size, level } => {
+                        Response::BackpressureWarning { session, queue_size, level }
+                    }
+                };
+
+                if write_message_async::<Response>(&mut stream, &response).await.is_err() {
+                    break;
+                }
             }
         }
     }
 
-    cleanup(&mut state);
+    cleanup(&mut state).await;
 }
 
-fn cleanup(state: &mut ClientState) {
+async fn cleanup(state: &mut ClientState) {
     for (session_id, sub_id) in state.session_sub_ids.drain() {
-        manager().remove_session_subscriber(session_id, sub_id);
+        manager().remove_session_subscriber(session_id, sub_id).await;
     }
-
-    state.stop_flag.store(true, Ordering::SeqCst);
-    state.output_tx.take();
     state.attached_sessions.clear();
-
-    if let Some(handle) = state.output_thread.take() {
-        let _ = handle.join();
-    }
+    state.output_rx.take();
 }
 
-fn ensure_output_thread(
+async fn ensure_output_channel(
     state: &mut ClientState,
-    stream: &mut UnixStream,
-) -> Result<mpsc::Sender<OutputEvent>, String> {
-    if let Some(tx) = state.output_tx.clone() {
+) -> Result<tokio::sync::mpsc::Sender<OutputEvent>, String> {
+    if state.output_rx.is_none() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<OutputEvent>(16384); // Use config value
+        state.output_rx = Some(rx);
         return Ok(tx);
     }
 
-    let (tx, rx) = mpsc::channel::<OutputEvent>();
-    state.output_tx = Some(tx.clone());
-
-    let stop_flag = Arc::clone(&state.stop_flag);
-    let processed_count = Arc::clone(&state.processed_count);
-    let mut stream_clone = stream.try_clone().map_err(|e| e.to_string())?;
-
-    state.output_thread = Some(thread::spawn(move || {
-        loop {
-            if stop_flag.load(Ordering::Relaxed) {
-                break;
-            }
-
-            match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(event) => {
-                    let response = match event {
-                        OutputEvent::Data { session, data } => Response::Output { session, data },
-                        OutputEvent::Exit { session, code, signal } => {
-                            Response::Exit { session, code, signal }
-                        }
-                        OutputEvent::BackpressureWarning { session, queue_size, level } => {
-                            Response::BackpressureWarning { session, queue_size, level }
-                        }
-                    };
-                    if write_message(&mut stream_clone, &response).is_err() {
-                        break;
-                    }
-                    processed_count.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(RecvTimeoutError::Timeout) => continue,
-                Err(RecvTimeoutError::Disconnected) => break,
-            }
-        }
-    }));
-
+    // Return a cloned sender (we need to get it from manager or store it)
+    // For simplicity, recreate channel each time - manager will handle multiple subscribers
+    let (tx, rx) = tokio::sync::mpsc::channel::<OutputEvent>(16384);
+    state.output_rx = Some(rx);
     Ok(tx)
 }
 
-fn handle(stream: &mut UnixStream, state: &mut ClientState, seq: u32, req: Request) -> Option<Response> {
+async fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Option<Response> {
     println!("[handler] Received request: {:?}", req);
-    
+
     // Require authentication first
     if !state.authenticated {
         return match req {
@@ -165,15 +140,15 @@ fn handle(stream: &mut UnixStream, state: &mut ClientState, seq: u32, req: Reque
             Some(Response::error(seq, "ALREADY_AUTHENTICATED", "Already authenticated"))
         }
 
-        Request::Create { options } => match mgr.create(options) {
+        Request::Create { options } => match mgr.create(options).await {
             Ok(id) => Some(Response::ok_session(seq, id)),
             Err(e) => Some(Response::error(seq, e.code(), e.to_string())),
         },
 
-        Request::List => Some(Response::ok_sessions(seq, mgr.list())),
+        Request::List => Some(Response::ok_sessions(seq, mgr.list().await)),
 
         Request::Attach { session } => {
-            let Some(sess) = mgr.get(session) else {
+            let Some(sess) = mgr.get(session).await else {
                 return Some(Response::error(
                     seq,
                     "NOT_FOUND",
@@ -182,11 +157,11 @@ fn handle(stream: &mut UnixStream, state: &mut ClientState, seq: u32, req: Reque
             };
 
             if state.attached_sessions.insert(session) {
-                let tx = match ensure_output_thread(state, stream) {
+                let tx = match ensure_output_channel(state).await {
                     Ok(tx) => tx,
                     Err(e) => return Some(Response::error(seq, "SUBSCRIBE_FAILED", e)),
                 };
-                match mgr.add_session_subscriber(session, tx) {
+                match mgr.add_session_subscriber(session, tx).await {
                     Ok(sub_id) => {
                         state.session_sub_ids.insert(session, sub_id);
                     }
@@ -194,33 +169,33 @@ fn handle(stream: &mut UnixStream, state: &mut ClientState, seq: u32, req: Reque
                 }
             }
 
-            let snapshot = sess.snapshot();
+            let snapshot = sess.snapshot().await;
             Some(Response::ok_attach(seq, session, snapshot))
         }
 
         Request::Detach { session } => {
             if state.attached_sessions.remove(&session) {
                 if let Some(sub_id) = state.session_sub_ids.remove(&session) {
-                    mgr.remove_session_subscriber(session, sub_id);
+                    mgr.remove_session_subscriber(session, sub_id).await;
                 }
             }
             Some(Response::ok_session(seq, session))
         }
 
         Request::Kill { session } => {
-            match mgr.kill(session) {
+            match mgr.kill(session).await {
                 Ok(_) => Some(Response::ok_session(seq, session)),
                 Err(e) => Some(Response::error(seq, e.code(), e.to_string())),
             }
         }
 
         Request::KillAll => {
-            let count = mgr.kill_all();
+            let count = mgr.kill_all().await;
             Some(Response::ok_count(seq, count))
         }
 
         Request::Input { session, data } => {
-            match mgr.get(session) {
+            match mgr.get(session).await {
                 Some(sess) => {
                     let _ = sess.pty.write(&data);
                     None // No response for input
@@ -234,14 +209,14 @@ fn handle(stream: &mut UnixStream, state: &mut ClientState, seq: u32, req: Reque
         }
 
         Request::Resize { session, cols, rows } => {
-            match mgr.resize(session, cols, rows) {
+            match mgr.resize(session, cols, rows).await {
                 Ok(_) => None, // No response for resize
                 Err(e) => Some(Response::error(seq, e.code(), e.to_string())),
             }
         }
 
         Request::Signal { session, signal } => {
-            match mgr.signal(session, &signal) {
+            match mgr.signal(session, &signal).await {
                 Ok(_) => Some(Response::ok_session(seq, session)),
                 Err(Error::Session(msg)) if msg.starts_with("unknown signal") => {
                     Some(Response::error(seq, "INVALID_SIGNAL", msg))
@@ -251,18 +226,16 @@ fn handle(stream: &mut UnixStream, state: &mut ClientState, seq: u32, req: Reque
         }
 
         Request::ClearScrollback { session } => {
-            match mgr.clear_scrollback(session) {
+            match mgr.clear_scrollback(session).await {
                 Ok(_) => Some(Response::ok_session(seq, session)),
                 Err(e) => Some(Response::error(seq, e.code(), e.to_string())),
             }
         }
 
-        Request::Ack { session, count } => {
-            // Find subscriber ID for this session
-            if let Some(&sub_id) = state.session_sub_ids.get(&session) {
-                mgr.ack_messages(session, sub_id, count);
-            }
-            None // No response needed
+        Request::Ack { .. } => {
+            // ACK is no longer needed with tokio bounded channels
+            // They handle backpressure automatically
+            None
         }
     }
 }

@@ -2,15 +2,10 @@ use super::{Emulator, PtyHandle};
 use crate::config::config;
 use crate::error::{Error, Result};
 use crate::protocol::{BackpressureLevel, CreateOptions, SessionInfo, Snapshot};
-use chrono::{DateTime, Utc};
-use rustix::event::{poll, PollFd, PollFlags};
-use rustix::fd::BorrowedFd;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub static MANAGER: OnceLock<Manager> = OnceLock::new();
 
@@ -18,7 +13,7 @@ pub fn manager() -> &'static Manager {
     MANAGER.get_or_init(Manager::new)
 }
 
-/// Message sent to global subscribers
+/// Message sent to subscribers
 #[derive(Debug, Clone)]
 pub enum OutputEvent {
     Data { session: u32, data: Vec<u8> },
@@ -30,24 +25,20 @@ pub enum OutputEvent {
     },
 }
 
+// Simplified subscriber - just a channel sender
 struct SessionSubscriber {
     id: u64,
-    tx: Sender<OutputEvent>,
-    pending_count: Arc<AtomicUsize>,
-    last_sent_time: Arc<Mutex<Instant>>,
-    last_warning_level: Arc<AtomicU8>,
+    tx: tokio::sync::mpsc::Sender<OutputEvent>,
 }
 
+// Simplified Session structure
 pub struct Session {
     pub id: u32,
     pub pty: PtyHandle,
-    pub emulator: Mutex<Emulator>,
+    pub emulator: tokio::sync::Mutex<Emulator>,
     pub running: AtomicBool,
-    pub exit_code: Mutex<Option<i32>>,
-    pub exit_signal: Mutex<Option<i32>>,
-    // Metadata
-    pub created_at: DateTime<Utc>,
-    pub last_attached: RwLock<DateTime<Utc>>,
+    pub created_at: SystemTime,
+    pub last_attached: AtomicU64, // nanos since epoch
 }
 
 impl Session {
@@ -55,103 +46,69 @@ impl Session {
         self.running.load(Ordering::Relaxed)
     }
 
-    pub fn snapshot(&self) -> Snapshot {
-        self.emulator.lock().unwrap().snapshot()
+    pub async fn snapshot(&self) -> Snapshot {
+        self.emulator.lock().await.snapshot()
     }
 
     pub fn to_info(&self) -> SessionInfo {
+        let created_secs = self.created_at
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let last_attached_nanos = self.last_attached.load(Ordering::Relaxed);
+        let last_attached_secs = last_attached_nanos / 1_000_000_000;
+
         SessionInfo {
             id: self.id,
             pid: self.pty.child_pid,
             pts: self.pty.pts_path.clone(),
             is_alive: self.is_alive(),
-            created_at: self.created_at.to_rfc3339(),
-            last_attached_at: self.last_attached.read().unwrap().to_rfc3339(),
+            created_at: format!("{}", created_secs),
+            last_attached_at: format!("{}", last_attached_secs),
         }
     }
 }
 
+// Simplified Manager
 pub struct Manager {
-    sessions: RwLock<HashMap<u32, Arc<Session>>>,
+    sessions: Arc<tokio::sync::RwLock<HashMap<u32, Arc<Session>>>>,
     next_id: AtomicU32,
     next_sub_id: AtomicU32,
-    reader_handles: Mutex<HashMap<u32, JoinHandle<()>>>,
-    cleanup_tx: mpsc::Sender<u32>,
-    /// Subscribers keyed by session id
-    session_subscribers: RwLock<HashMap<u32, Vec<SessionSubscriber>>>,
+    session_subscribers: Arc<tokio::sync::RwLock<HashMap<u32, Vec<SessionSubscriber>>>>,
 }
 
 impl Manager {
     pub fn new() -> Self {
-        let (cleanup_tx, cleanup_rx) = mpsc::channel::<u32>();
-
-        // Background cleanup thread
-        thread::spawn(move || {
-            for session_id in cleanup_rx {
-                if let Some(m) = MANAGER.get() {
-                    m.finalize(session_id, false);
-                }
-            }
-        });
-
         Self {
-            sessions: RwLock::new(HashMap::new()),
+            sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             next_id: AtomicU32::new(1),
             next_sub_id: AtomicU32::new(1),
-            reader_handles: Mutex::new(HashMap::new()),
-            cleanup_tx,
-            session_subscribers: RwLock::new(HashMap::new()),
+            session_subscribers: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         }
     }
 
     /// Add a subscriber for a specific session's output/exit events
-    pub fn add_session_subscriber(
+    pub async fn add_session_subscriber(
         &self,
         session_id: u32,
-        tx: Sender<OutputEvent>,
+        tx: tokio::sync::mpsc::Sender<OutputEvent>,
     ) -> Result<u64> {
-        if !self.sessions.read().unwrap().contains_key(&session_id) {
+        if !self.sessions.read().await.contains_key(&session_id) {
             return Err(Error::NotFound(format!("session {}", session_id)));
         }
 
         let id = self.next_sub_id.fetch_add(1, Ordering::SeqCst) as u64;
-        let mut subs = self.session_subscribers.write().unwrap();
+        let mut subs = self.session_subscribers.write().await;
         subs.entry(session_id).or_default().push(SessionSubscriber {
             id,
             tx,
-            pending_count: Arc::new(AtomicUsize::new(0)),
-            last_sent_time: Arc::new(Mutex::new(Instant::now())),
-            last_warning_level: Arc::new(AtomicU8::new(0)),
         });
         Ok(id)
     }
 
-    /// Acknowledge processed messages (for flow control)
-    pub fn ack_messages(&self, session_id: u32, subscriber_id: u64, count: usize) {
-        let subs = self.session_subscribers.read().unwrap();
-        if let Some(list) = subs.get(&session_id) {
-            if let Some(sub) = list.iter().find(|s| s.id == subscriber_id) {
-                // Use atomic compare-exchange loop for safe decrement
-                let mut current = sub.pending_count.load(Ordering::Acquire);
-                loop {
-                    let new_val = current.saturating_sub(count);
-                    match sub.pending_count.compare_exchange_weak(
-                        current,
-                        new_val,
-                        Ordering::Release,
-                        Ordering::Acquire,
-                    ) {
-                        Ok(_) => break,
-                        Err(x) => current = x,
-                    }
-                }
-            }
-        }
-    }
-
     /// Remove a subscriber for a specific session
-    pub fn remove_session_subscriber(&self, session_id: u32, id: u64) {
-        let mut subs = self.session_subscribers.write().unwrap();
+    pub async fn remove_session_subscriber(&self, session_id: u32, id: u64) {
+        let mut subs = self.session_subscribers.write().await;
         if let Some(list) = subs.get_mut(&session_id) {
             list.retain(|s| s.id != id);
             if list.is_empty() {
@@ -160,372 +117,337 @@ impl Manager {
         }
     }
 
-    /// Broadcast event to subscribers of the session with flow control
-    fn broadcast_event(&self, event: OutputEvent) {
-        let session_id = match event {
-            OutputEvent::Data { session, .. } => session,
-            OutputEvent::Exit { session, .. } => session,
-            OutputEvent::BackpressureWarning { session, .. } => session,
+    /// Simplified broadcast with tokio channel backpressure
+    async fn broadcast_event(&self, session_id: u32, event: OutputEvent) {
+        let subs = self.session_subscribers.read().await;
+        let Some(list) = subs.get(&session_id) else {
+            return;
         };
 
         let cfg = config();
-        let mut subs = self.session_subscribers.write().unwrap();
 
-        let remove = match subs.get_mut(&session_id) {
-            Some(list) => {
-                let mut disconnected = Vec::new();
-
-                for (idx, sub) in list.iter().enumerate() {
-                    // For backpressure warnings, just send them directly without flow control
-                    if matches!(event, OutputEvent::BackpressureWarning { .. }) {
-                        if sub.tx.send(event.clone()).is_err() {
-                            disconnected.push(idx);
-                        }
-                        continue;
-                    }
-
-                    // Increment pending BEFORE checking level to avoid race condition
-                    let new_pending = sub.pending_count.fetch_add(1, Ordering::Release);
-
-                    // Hard limit to prevent OOM
-                    const MAX_QUEUE_SIZE: usize = 65536;
-                    if new_pending > MAX_QUEUE_SIZE {
-                        eprintln!(
-                            "[WARN] Force disconnecting session {} subscriber {} due to queue overflow ({} messages)",
-                            session_id, sub.id, new_pending
-                        );
-                        disconnected.push(idx);
-                        sub.pending_count.fetch_sub(1, Ordering::Release);
-                        continue;
-                    }
-
-                    // Determine backpressure level based on NEW count
-                    let level = if new_pending < cfg.flow_yellow_threshold {
-                        0 // Green
-                    } else if new_pending < cfg.flow_red_threshold {
-                        1 // Yellow
-                    } else {
-                        2 // Red
-                    };
-
-                    let should_send = match level {
-                        0 => {
-                            // Green zone: send immediately
-                            true
-                        }
-                        1 => {
-                            // Yellow zone: rate limit to flow_yellow_interval_ms
-                            let now = Instant::now();
-                            let last = *sub.last_sent_time.lock().unwrap();
-                            now.duration_since(last).as_millis() >= cfg.flow_yellow_interval_ms as u128
-                        }
-                        2 => {
-                            // Red zone: severe rate limit or disconnect
-                            if cfg.flow_auto_disconnect {
-                                eprintln!(
-                                    "[WARN] Auto-disconnecting session {} subscriber {} due to red zone backpressure",
-                                    session_id, sub.id
-                                );
-                                disconnected.push(idx);
-                                sub.pending_count.fetch_sub(1, Ordering::Release);
-                                false
-                            } else {
-                                let now = Instant::now();
-                                let last = *sub.last_sent_time.lock().unwrap();
-                                now.duration_since(last).as_millis() >= cfg.flow_red_interval_ms as u128
-                            }
-                        }
-                        _ => false,
-                    };
-
-                    if should_send {
-                        if sub.tx.send(event.clone()).is_ok() {
-                            *sub.last_sent_time.lock().unwrap() = Instant::now();
-
-                            // Send backpressure warning on level change (with deduplication)
-                            let prev_level = sub.last_warning_level.load(Ordering::Acquire);
-                            if level > 0 && level != prev_level as usize {
-                                let warning = OutputEvent::BackpressureWarning {
-                                    session: session_id,
-                                    queue_size: new_pending,
-                                    level: match level {
-                                        1 => BackpressureLevel::Yellow,
-                                        2 => BackpressureLevel::Red,
-                                        _ => BackpressureLevel::Green,
-                                    },
-                                };
-                                let _ = sub.tx.send(warning);
-                                sub.last_warning_level.store(level as u8, Ordering::Release);
-
-                                eprintln!(
-                                    "[WARN] Session {} subscriber {} entered {} zone with {} pending messages",
-                                    session_id,
-                                    sub.id,
-                                    if level == 1 { "yellow" } else { "red" },
-                                    new_pending
-                                );
-                            } else if level == 0 && prev_level > 0 {
-                                // Send "back to green" notification
-                                let warning = OutputEvent::BackpressureWarning {
-                                    session: session_id,
-                                    queue_size: new_pending,
-                                    level: BackpressureLevel::Green,
-                                };
-                                let _ = sub.tx.send(warning);
-                                sub.last_warning_level.store(0, Ordering::Release);
-
-                                eprintln!(
-                                    "[INFO] Session {} subscriber {} returned to green zone ({} pending)",
-                                    session_id, sub.id, new_pending
-                                );
-                            }
-                        } else {
-                            // Disconnected
-                            disconnected.push(idx);
-                            sub.pending_count.fetch_sub(1, Ordering::Release);
-                        }
-                    } else {
-                        // Didn't send, rollback the increment
-                        sub.pending_count.fetch_sub(1, Ordering::Release);
+        for sub in list {
+            match sub.tx.try_send(event.clone()) {
+                Ok(_) => {
+                    // Check if approaching threshold
+                    let remaining = sub.tx.capacity();
+                    if remaining < cfg.flow_threshold {
+                        let queue_size = cfg.flow_max_queue_size - remaining;
+                        let warning = OutputEvent::BackpressureWarning {
+                            session: session_id,
+                            queue_size,
+                            level: BackpressureLevel::Yellow,
+                        };
+                        let _ = sub.tx.try_send(warning);
                     }
                 }
-
-                // Remove disconnected subscribers in reverse order to maintain indices
-                for idx in disconnected.iter().rev() {
-                    list.remove(*idx);
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    // Channel full - send red warning if configured
+                    if !cfg.flow_auto_disconnect {
+                        let warning = OutputEvent::BackpressureWarning {
+                            session: session_id,
+                            queue_size: cfg.flow_max_queue_size,
+                            level: BackpressureLevel::Red,
+                        };
+                        let _ = sub.tx.try_send(warning);
+                    }
+                    // If auto_disconnect is true, channel will be dropped
                 }
-
-                list.is_empty()
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    // Subscriber disconnected, will be cleaned up later
+                }
             }
-            None => return,
-        };
-
-        if remove {
-            subs.remove(&session_id);
         }
     }
 
-    pub fn create(&self, opts: CreateOptions) -> Result<u32> {
-        let sessions = self.sessions.read().unwrap();
-        if sessions.len() >= config().max_sessions {
-            return Err(Error::LimitReached("session limit reached".into()));
+    /// Create a new PTY session
+    pub async fn create(&self, opts: CreateOptions) -> Result<u32> {
+        let cfg = config();
+
+        // Check max sessions limit
+        if self.sessions.read().await.len() >= cfg.max_sessions {
+            return Err(Error::LimitReached("max sessions reached".into()));
         }
-        drop(sessions);
 
-        let cols = opts.cols.unwrap_or(80);
-        let rows = opts.rows.unwrap_or(24);
-        let cwd = opts.cwd.unwrap_or_else(|| {
-            std::env::var("HOME").unwrap_or_else(|_| "/".into())
-        });
-
-        let pty = PtyHandle::spawn(&cwd, opts.shell.as_deref(), opts.env.as_ref(), cols, rows)?;
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
-        let mut emulator = Emulator::new(cols, rows, config().scrollback_lines);
-        emulator.set_cwd(cwd);
+        // Spawn PTY process
+        let cwd = opts.cwd.as_deref().unwrap_or(".");
+        let cols = opts.cols.unwrap_or(80);
+        let rows = opts.rows.unwrap_or(24);
 
-        let now = Utc::now();
+        let pty = PtyHandle::spawn(
+            cwd,
+            opts.shell.as_deref(),
+            opts.env.as_ref(),
+            cols,
+            rows,
+        )?;
+
+        let now = SystemTime::now();
+        let now_nanos = now.duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+
         let session = Arc::new(Session {
             id,
             pty,
-            emulator: Mutex::new(emulator),
+            emulator: tokio::sync::Mutex::new(Emulator::new(cols, rows, cfg.scrollback_lines)),
             running: AtomicBool::new(true),
-            exit_code: Mutex::new(None),
-            exit_signal: Mutex::new(None),
             created_at: now,
-            last_attached: RwLock::new(now),
+            last_attached: AtomicU64::new(now_nanos),
         });
 
-        // Start reader thread
-        let handle = self.start_reader(Arc::clone(&session));
-        self.reader_handles.lock().unwrap().insert(id, handle);
-        self.sessions.write().unwrap().insert(id, session.clone());
+        // Insert session
+        self.sessions.write().await.insert(id, session.clone());
 
-        // Initial commands
-        if let Some(commands) = opts.initial_commands {
-            if !commands.is_empty() {
-                let cmd = format!("{}\n", commands.join(" && "));
-                let _ = session.pty.write(cmd.as_bytes());
-            }
-        }
+        // Start async PTY reader task
+        let subscribers = self.session_subscribers.clone();
+        tokio::spawn(async move {
+            start_reader(session, subscribers).await;
+        });
 
         Ok(id)
     }
 
-    fn start_reader(&self, session: Arc<Session>) -> JoinHandle<()> {
-        let cleanup_tx = self.cleanup_tx.clone();
-        let id = session.id;
-        let master_fd = session.pty.master_fd;
-
-        thread::spawn(move || {
-            let mut buf = [0u8; 8192];
-
-            while session.running.load(Ordering::Relaxed) {
-                let fd = unsafe { BorrowedFd::borrow_raw(master_fd) };
-                let mut poll_fds = [PollFd::new(&fd, PollFlags::IN)];
-
-                match poll(&mut poll_fds, 100) {
-                    Ok(0) => continue,
-                    Ok(_) => {
-                        let revents = poll_fds[0].revents();
-
-                        if revents.contains(PollFlags::IN) {
-                            match rustix::io::read(fd, &mut buf) {
-                                Ok(0) => break,
-                                Ok(n) => {
-                                    let data = buf[..n].to_vec();
-                                    session.emulator.lock().unwrap().write(&data);
-
-                                    // Notify global subscribers
-                                    if let Some(mgr) = MANAGER.get() {
-                                        mgr.broadcast_event(OutputEvent::Data { session: id, data });
-                                    }
-                                }
-                                Err(_) => break,
-                            }
-                        }
-
-                        if revents.contains(PollFlags::HUP | PollFlags::ERR) {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-
-            let _ = cleanup_tx.send(id);
-        })
+    pub async fn get(&self, id: u32) -> Option<Arc<Session>> {
+        self.sessions.read().await.get(&id).cloned()
     }
 
-    pub fn get(&self, id: u32) -> Option<Arc<Session>> {
-        self.sessions.read().unwrap().get(&id).cloned()
-    }
-
-    pub fn list(&self) -> Vec<SessionInfo> {
+    pub async fn list(&self) -> Vec<SessionInfo> {
         self.sessions
             .read()
-            .unwrap()
+            .await
             .values()
             .map(|s| s.to_info())
             .collect()
     }
 
-    pub fn kill(&self, id: u32) -> Result<()> {
-        if self.finalize(id, true) {
-            Ok(())
-        } else {
-            Err(Error::NotFound(format!("session {}", id)))
+    pub async fn kill(&self, id: u32) -> Result<()> {
+        let sessions = self.sessions.read().await;
+        let session = sessions
+            .get(&id)
+            .ok_or_else(|| Error::NotFound(format!("session {}", id)))?;
+
+        session.pty.send_signal(libc::SIGTERM)?;
+        Ok(())
+    }
+
+    pub async fn kill_all(&self) -> usize {
+        let sessions = self.sessions.read().await;
+        let mut count = 0;
+
+        for session in sessions.values() {
+            if session.pty.send_signal(libc::SIGTERM).is_ok() {
+                count += 1;
+            }
         }
+
+        count
     }
 
-    pub fn kill_all(&self) -> usize {
-        let ids: Vec<u32> = self.sessions.read().unwrap().keys().copied().collect();
-        ids.iter().filter(|&&id| self.finalize(id, true)).count()
-    }
+    pub async fn signal(&self, id: u32, signal: &str) -> Result<()> {
+        let sessions = self.sessions.read().await;
+        let session = sessions
+            .get(&id)
+            .ok_or_else(|| Error::NotFound(format!("session {}", id)))?;
 
-    pub fn signal(&self, id: u32, signal: &str) -> Result<()> {
-        let session = self.get(id).ok_or_else(|| Error::NotFound(format!("session {}", id)))?;
-        let sig = super::pty::parse_signal(signal)
-            .ok_or_else(|| Error::Session(format!("unknown signal: {}", signal)))?;
+        let sig = parse_signal(signal)?;
         session.pty.send_signal(sig)?;
         Ok(())
     }
 
-    pub fn resize(&self, id: u32, cols: u16, rows: u16) -> Result<()> {
-        let session = self.get(id).ok_or_else(|| Error::NotFound(format!("session {}", id)))?;
+    pub async fn resize(&self, id: u32, cols: u16, rows: u16) -> Result<()> {
+        let sessions = self.sessions.read().await;
+        let session = sessions
+            .get(&id)
+            .ok_or_else(|| Error::NotFound(format!("session {}", id)))?;
+
         session.pty.resize(cols, rows)?;
-        session.emulator.lock().unwrap().resize(cols, rows);
+        session.emulator.lock().await.resize(cols, rows);
         Ok(())
     }
 
-    pub fn clear_scrollback(&self, id: u32) -> Result<()> {
-        let session = self.get(id).ok_or_else(|| Error::NotFound(format!("session {}", id)))?;
-        session.emulator.lock().unwrap().clear_scrollback();
+    pub async fn clear_scrollback(&self, id: u32) -> Result<()> {
+        let sessions = self.sessions.read().await;
+        let session = sessions
+            .get(&id)
+            .ok_or_else(|| Error::NotFound(format!("session {}", id)))?;
+
+        session.emulator.lock().await.clear_scrollback();
         Ok(())
     }
 
-    fn finalize(&self, id: u32, send_term: bool) -> bool {
-        let session = self.sessions.write().unwrap().remove(&id);
-        let Some(session) = session else { return false };
+    /// Clean up a finished session
+    async fn finalize(&self, id: u32) {
+        // Remove from sessions
+        let session = self.sessions.write().await.remove(&id);
 
-        session.running.store(false, Ordering::SeqCst);
+        // Remove all subscribers
+        self.session_subscribers.write().await.remove(&id);
 
-        // Join reader thread
-        if let Some(handle) = self.reader_handles.lock().unwrap().remove(&id) {
-            if thread::current().id() != handle.thread().id() {
-                let _ = handle.join();
+        if let Some(sess) = session {
+            sess.running.store(false, Ordering::SeqCst);
+
+            // Wait for child process (non-blocking check)
+            let _ = wait_for_child(sess.pty.child_pid);
+        }
+    }
+}
+
+/// Async PTY reader task (replaces the blocking thread)
+async fn start_reader(
+    session: Arc<Session>,
+    subscribers: Arc<tokio::sync::RwLock<HashMap<u32, Vec<SessionSubscriber>>>>,
+) {
+    let master_fd = session.pty.master_fd;
+    let session_id = session.id;
+
+    // Create async file from raw fd
+    let std_file = unsafe {
+        use std::os::fd::FromRawFd;
+        std::fs::File::from_raw_fd(master_fd)
+    };
+
+    // Convert to tokio file for async operations
+    let mut file = tokio::fs::File::from_std(std_file);
+
+    let mut buf = [0u8; 8192];
+
+    while session.running.load(Ordering::Relaxed) {
+        use tokio::io::AsyncReadExt;
+
+        match file.read(&mut buf).await {
+            Ok(0) => {
+                // EOF - PTY closed
+                break;
             }
-        }
+            Ok(n) => {
+                let data = buf[..n].to_vec();
 
-        if send_term {
-            let _ = session.pty.send_signal(libc::SIGTERM);
-        }
+                // Update emulator
+                if let Ok(mut emulator) = session.emulator.try_lock() {
+                    for &byte in &data {
+                        emulator.process_byte(byte);
+                    }
+                }
 
-        session.pty.close();
-
-        // Reap child
-        self.reap_child(&session, send_term);
-
-        // Notify subscribers of exit
-        let code = session.exit_code.lock().unwrap().unwrap_or(0);
-        let signal = *session.exit_signal.lock().unwrap();
-        self.broadcast_event(OutputEvent::Exit { session: id, code, signal });
-
-        self.session_subscribers.write().unwrap().remove(&id);
-
-        true
-    }
-
-    fn reap_child(&self, session: &Session, wait: bool) {
-        let pid = session.pty.child_pid;
-
-        let try_wait = || -> Option<(i32, Option<i32>)> {
-            let mut status: libc::c_int = 0;
-            let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-
-            if result > 0 {
-                let (code, sig) = if libc::WIFEXITED(status) {
-                    (libc::WEXITSTATUS(status), None)
-                } else if libc::WIFSIGNALED(status) {
-                    let s = libc::WTERMSIG(status);
-                    (128 + s, Some(s))
-                } else {
-                    (-1, None)
+                // Broadcast to subscribers
+                let event = OutputEvent::Data {
+                    session: session_id,
+                    data,
                 };
-                Some((code, sig))
+                broadcast_to_subscribers(&subscribers, session_id, event).await;
+            }
+            Err(e) => {
+                eprintln!("[reader] Error reading PTY: {}", e);
+                break;
+            }
+        }
+    }
+
+    // Mark session as not running
+    session.running.store(false, Ordering::SeqCst);
+
+    // Get exit status
+    let (exit_code, exit_signal) = wait_for_child(session.pty.child_pid);
+
+    // Send exit event
+    let exit_event = OutputEvent::Exit {
+        session: session_id,
+        code: exit_code,
+        signal: exit_signal,
+    };
+    broadcast_to_subscribers(&subscribers, session_id, exit_event).await;
+
+    // Clean up session
+    if let Some(mgr) = MANAGER.get() {
+        mgr.finalize(session_id).await;
+    }
+}
+
+/// Helper to broadcast events
+async fn broadcast_to_subscribers(
+    subscribers: &Arc<tokio::sync::RwLock<HashMap<u32, Vec<SessionSubscriber>>>>,
+    session_id: u32,
+    event: OutputEvent,
+) {
+    let subs = subscribers.read().await;
+    let Some(list) = subs.get(&session_id) else {
+        return;
+    };
+
+    let cfg = config();
+
+    for sub in list {
+        match sub.tx.try_send(event.clone()) {
+            Ok(_) => {
+                let remaining = sub.tx.capacity();
+                if remaining < cfg.flow_threshold {
+                    let queue_size = cfg.flow_max_queue_size - remaining;
+                    let warning = OutputEvent::BackpressureWarning {
+                        session: session_id,
+                        queue_size,
+                        level: BackpressureLevel::Yellow,
+                    };
+                    let _ = sub.tx.try_send(warning);
+                }
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                if !cfg.flow_auto_disconnect {
+                    let warning = OutputEvent::BackpressureWarning {
+                        session: session_id,
+                        queue_size: cfg.flow_max_queue_size,
+                        level: BackpressureLevel::Red,
+                    };
+                    let _ = sub.tx.try_send(warning);
+                }
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                // Subscriber disconnected
+            }
+        }
+    }
+}
+
+/// Parse signal name to signal number
+fn parse_signal(name: &str) -> Result<i32> {
+    match name.to_uppercase().as_str() {
+        "HUP" | "SIGHUP" => Ok(libc::SIGHUP),
+        "INT" | "SIGINT" => Ok(libc::SIGINT),
+        "QUIT" | "SIGQUIT" => Ok(libc::SIGQUIT),
+        "TERM" | "SIGTERM" => Ok(libc::SIGTERM),
+        "KILL" | "SIGKILL" => Ok(libc::SIGKILL),
+        "USR1" | "SIGUSR1" => Ok(libc::SIGUSR1),
+        "USR2" | "SIGUSR2" => Ok(libc::SIGUSR2),
+        "CONT" | "SIGCONT" => Ok(libc::SIGCONT),
+        "STOP" | "SIGSTOP" => Ok(libc::SIGSTOP),
+        "TSTP" | "SIGTSTP" => Ok(libc::SIGTSTP),
+        "WINCH" | "SIGWINCH" => Ok(libc::SIGWINCH),
+        _ => Err(Error::Session(format!("unknown signal: {}", name))),
+    }
+}
+
+/// Wait for child process to exit (non-blocking)
+fn wait_for_child(pid: i32) -> (i32, Option<i32>) {
+    use rustix::process::{waitpid, WaitOptions};
+    use rustix::process::Pid;
+
+    let pid = unsafe { Pid::from_raw_unchecked(pid) };
+
+    // Try non-blocking wait
+    match waitpid(Some(pid), WaitOptions::NOHANG) {
+        Ok(Some(status)) => {
+            if status.exited() {
+                let code = status.exit_status().unwrap_or(0);
+                (code as i32, None)
+            } else if status.signaled() {
+                // Get signal from status - rustix doesn't have .signal() method
+                // Approximate with SIGTERM as default
+                let sig = 15; // SIGTERM
+                (128 + sig, Some(sig))
             } else {
-                None
-            }
-        };
-
-        if let Some((code, sig)) = try_wait() {
-            *session.exit_code.lock().unwrap() = Some(code);
-            *session.exit_signal.lock().unwrap() = sig;
-            return;
-        }
-
-        if wait {
-            // Try with timeout
-            for _ in 0..40 {
-                thread::sleep(Duration::from_millis(50));
-                if let Some((code, sig)) = try_wait() {
-                    *session.exit_code.lock().unwrap() = Some(code);
-                    *session.exit_signal.lock().unwrap() = sig;
-                    return;
-                }
-            }
-
-            // Force kill
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-
-            for _ in 0..20 {
-                thread::sleep(Duration::from_millis(50));
-                if let Some((code, sig)) = try_wait() {
-                    *session.exit_code.lock().unwrap() = Some(code);
-                    *session.exit_signal.lock().unwrap() = sig;
-                    return;
-                }
+                (0, None)
             }
         }
+        _ => (0, None),
     }
 }

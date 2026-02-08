@@ -1,3 +1,3 @@
 mod handler;
 
-pub use handler::serve;
+pub use handler::handle_connection;

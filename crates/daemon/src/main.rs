@@ -6,16 +6,16 @@ mod server;
 mod session;
 
 use config::config;
-use server::serve;
+use server::handle_connection;
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cfg = config();
 
     eprintln!(
@@ -35,8 +35,8 @@ fn main() {
         return;
     }
 
-    // Bind
-    let listener = match UnixListener::bind(&cfg.socket_path) {
+    // Bind using std::os::unix::net::UnixListener (for prepare_socket compatibility)
+    let listener = match std::os::unix::net::UnixListener::bind(&cfg.socket_path) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("[daemon] Failed to bind socket: {}", e);
@@ -53,17 +53,22 @@ fn main() {
         eprintln!("[daemon] Warning: failed to write PID file: {}", e);
     }
 
-    install_signal_handlers();
-    listener.set_nonblocking(true).ok();
+    // Install async signal handlers
+    tokio::spawn(async {
+        install_signal_handlers().await;
+    });
 
     eprintln!("[daemon] Listening on {}", cfg.socket_path);
     eprintln!("[daemon] PID: {}", std::process::id());
 
     let active = Arc::new(AtomicU32::new(0));
 
-    // Accept loop
+    // Convert to tokio UnixListener
+    let listener = tokio::net::UnixListener::from_std(listener).expect("Failed to convert listener");
+
+    // Async accept loop - no polling needed!
     while !SHUTDOWN.load(Ordering::Relaxed) {
-        match listener.accept() {
+        match listener.accept().await {
             Ok((stream, _)) => {
                 let count = active.fetch_add(1, Ordering::SeqCst) + 1;
 
@@ -73,17 +78,11 @@ fn main() {
                     continue;
                 }
 
-                // Set stream to blocking mode for the handler thread
-                stream.set_nonblocking(false).ok();
-                
                 let active = Arc::clone(&active);
-                std::thread::spawn(move || {
-                    serve(stream);
+                tokio::spawn(async move {
+                    handle_connection(stream).await;
                     active.fetch_sub(1, Ordering::SeqCst);
                 });
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(std::time::Duration::from_millis(10));
             }
             Err(e) => {
                 eprintln!("[daemon] Accept error: {}", e);
@@ -113,16 +112,27 @@ fn prepare_socket(path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-fn install_signal_handlers() {
-    unsafe {
-        libc::signal(libc::SIGINT, handle_signal as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, handle_signal as libc::sighandler_t);
-        libc::signal(libc::SIGHUP, handle_signal as libc::sighandler_t);
-    }
-}
+async fn install_signal_handlers() {
+    use tokio::signal::unix::{signal, SignalKind};
 
-extern "C" fn handle_signal(_: libc::c_int) {
-    SHUTDOWN.store(true, Ordering::SeqCst);
+    let mut sigint = signal(SignalKind::interrupt()).expect("Failed to install SIGINT handler");
+    let mut sigterm = signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
+    let mut sighup = signal(SignalKind::hangup()).expect("Failed to install SIGHUP handler");
+
+    tokio::select! {
+        _ = sigint.recv() => {
+            eprintln!("[daemon] Received SIGINT, shutting down...");
+            SHUTDOWN.store(true, Ordering::SeqCst);
+        }
+        _ = sigterm.recv() => {
+            eprintln!("[daemon] Received SIGTERM, shutting down...");
+            SHUTDOWN.store(true, Ordering::SeqCst);
+        }
+        _ = sighup.recv() => {
+            eprintln!("[daemon] Received SIGHUP, shutting down...");
+            SHUTDOWN.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 fn cleanup() {

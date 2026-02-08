@@ -13,6 +13,10 @@ async function main() {
   const client = createClient({
     socketPath: "/tmp/rust-pty.sock",
     autoStart: true,
+    flowControl: {
+      ackThreshold: 100, // Auto-ACK every 100 messages
+      manualAck: false   // Enable auto-ACK
+    }
   });
 
   // Track backpressure state
@@ -71,7 +75,7 @@ async function main() {
   client.setAckThreshold(100);
 
   // Option 2: Manual ACK only
-  // client.setAckThreshold(0);
+  // client.setManualAckMode(true);
   // let pendingAck = 0;
 
   // Process output with backpressure awareness
@@ -92,7 +96,7 @@ async function main() {
     }
 
     // Example: Manual ACK every 50 messages
-    // if (client.getAckThreshold() === 0) {
+    // if (client.getFlowControlConfig().manualAckMode) {
     //   pendingAck++;
     //   if (pendingAck >= 50) {
     //     client.ack(session, pendingAck);
@@ -191,9 +195,75 @@ async function advancedExample() {
   client.write(session, new TextEncoder().encode("ls -la /usr/bin\n"));
 }
 
+// Manual ACK example
+async function manualAckExample() {
+  const client = createClient({
+    socketPath: "/tmp/rust-pty.sock",
+    autoStart: true,
+    flowControl: {
+      manualAck: true // Disable auto-ACK for precise control
+    }
+  });
+
+  await client.waitForConnection();
+  console.log("Connected with manual ACK mode");
+
+  const { session } = await client.create({
+    cwd: process.cwd(),
+    cols: 80,
+    rows: 24
+  });
+
+  await client.attach(session);
+
+  let messageCount = 0;
+
+  client.on("output", (event) => {
+    messageCount++;
+
+    // Process the output
+    process.stdout.write(event.data);
+
+    // Manual ACK every 10 messages for demonstration
+    if (messageCount % 10 === 0) {
+      const pending = client.getPendingCount(session);
+      console.log(`\nACKing ${pending} messages...`);
+      client.ack(session, pending);
+    }
+  });
+
+  client.on("backpressure_warning", (event) => {
+    console.log(`\n[Backpressure] ${event.level}: ${event.queue_size} pending`);
+
+    if (event.level === "red") {
+      // Emergency ACK in red zone
+      const pending = client.getPendingCount(session);
+      if (pending > 0) {
+        console.log(`Emergency ACK of ${pending} messages`);
+        client.ack(session, pending);
+      }
+    }
+  });
+
+  // Generate output
+  client.write(session, new TextEncoder().encode("seq 1 100\n"));
+
+  // Show flow control config
+  setTimeout(() => {
+    const config = client.getFlowControlConfig();
+    console.log(`\nFlow Control Config:`, config);
+  }, 1000);
+}
+
 // Run the example
 if (require.main === module) {
-  main().catch(console.error);
+  const mode = process.argv[2] || "auto";
+
+  if (mode === "manual") {
+    manualAckExample().catch(console.error);
+  } else {
+    main().catch(console.error);
+  }
 }
 
 export { main, advancedExample, BackpressureAwareTerminal };
