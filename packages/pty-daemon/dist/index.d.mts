@@ -166,14 +166,15 @@ declare class DaemonError extends Error {
 }
 type FlowControlOptions = {
   /**
-   * Auto-ACK threshold (default: 100).
-   * Client will automatically acknowledge every N processed messages.
-   * Set to 0 to disable auto-ACK.
+   * Local flow-control counter threshold (default: 100).
+   * When reached, the local processed counter is reset to 0.
+   * Set to 0 to keep an ever-growing processed counter.
    */
   ackThreshold?: number;
   /**
-   * Manual ACK mode. When true, disables auto-ACK and requires manual ACK calls.
-   * Use this for fine-grained flow control.
+   * Manual ACK mode.
+   * When true, local counters never auto-reset.
+   * Use with explicit `ack()` calls if you need protocol-level compatibility behavior.
    */
   manualAck?: boolean;
 };
@@ -232,13 +233,12 @@ declare class PtyDaemonClient extends EventEmitter<PtyDaemonClientEvents> {
   signal(session: number, signal: string, reqOptions?: RequestOptions): Promise<void>;
   clearScrollback(session: number, reqOptions?: RequestOptions): Promise<void>;
   /**
-   * Acknowledge processed messages for flow control
-   * This helps the daemon track backpressure and prevent disconnections
+   * Send protocol-level ACK (currently compatibility/no-op on daemon side).
    */
   ack(session: number, count: number): void;
   /**
-   * Set the threshold for automatic ACKs (default: 100 messages)
-   * Set to 0 to disable automatic ACKs
+   * Set local counter reset threshold (default: 100 messages).
+   * Set to 0 to disable automatic local reset.
    */
   setAckThreshold(threshold: number): void;
   /**

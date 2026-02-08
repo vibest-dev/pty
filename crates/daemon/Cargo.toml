@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1.40", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "signal", "fs", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 rustix = { version = "0.38", features = ["pty", "process", "termios", "event", "fs"] }
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }

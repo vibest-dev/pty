@@ -1,9 +1,12 @@
 use crate::auth;
 use crate::config::config;
 use crate::error::Error;
-use crate::protocol::{read_message_async, write_message_async, Request, RequestEnvelope, Response, PROTOCOL_VERSION};
+use crate::protocol::{
+    read_message_async, write_message_async, Request, RequestEnvelope, Response, PROTOCOL_VERSION,
+};
 use crate::session::{manager, OutputEvent};
 use std::collections::HashSet;
+use tokio_stream::{wrappers::ReceiverStream, StreamExt, StreamMap};
 
 const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -11,9 +14,8 @@ struct ClientState {
     authenticated: bool,
     /// Sessions attached by this client connection.
     attached_sessions: HashSet<u32>,
-    /// Shared output channel for all attached sessions on this connection.
-    output_tx: Option<tokio::sync::mpsc::Sender<OutputEvent>>,
-    output_rx: Option<tokio::sync::mpsc::Receiver<OutputEvent>>,
+    /// Per-session output streams.
+    output_streams: StreamMap<u32, ReceiverStream<OutputEvent>>,
 }
 
 impl Default for ClientState {
@@ -21,36 +23,48 @@ impl Default for ClientState {
         Self {
             authenticated: false,
             attached_sessions: HashSet::new(),
-            output_tx: None,
-            output_rx: None,
+            output_streams: StreamMap::new(),
         }
     }
 }
 
-fn ensure_output_channel(state: &mut ClientState) -> tokio::sync::mpsc::Sender<OutputEvent> {
-    if let Some(tx) = state.output_tx.as_ref() {
-        return tx.clone();
-    }
-
+fn add_session_output_channel(
+    state: &mut ClientState,
+    session_id: u32,
+) -> tokio::sync::mpsc::Sender<OutputEvent> {
     let (tx, rx) = tokio::sync::mpsc::channel::<OutputEvent>(config().flow_max_queue_size);
-    state.output_tx = Some(tx.clone());
-    state.output_rx = Some(rx);
+    state
+        .output_streams
+        .insert(session_id, ReceiverStream::new(rx));
     tx
 }
 
 fn output_event_to_response(event: OutputEvent) -> Response {
     match event {
         OutputEvent::Data { session, data } => Response::Output { session, data },
-        OutputEvent::Exit { session, code, signal } => Response::Exit { session, code, signal },
-        OutputEvent::BackpressureWarning { session, queue_size, level } => {
-            Response::BackpressureWarning { session, queue_size, level }
-        }
+        OutputEvent::Exit {
+            session,
+            code,
+            signal,
+        } => Response::Exit {
+            session,
+            code,
+            signal,
+        },
+        OutputEvent::BackpressureWarning {
+            session,
+            queue_size,
+            level,
+        } => Response::BackpressureWarning {
+            session,
+            queue_size,
+            level,
+        },
     }
 }
 
 pub async fn handle_connection(stream: tokio::net::UnixStream) {
     let mut state = ClientState::default();
-    ensure_output_channel(&mut state);
     let mut stream = stream;
 
     loop {
@@ -67,15 +81,18 @@ pub async fn handle_connection(stream: tokio::net::UnixStream) {
                 }
             }
 
-            Some(event) = async {
-                match state.output_rx.as_mut() {
-                    Some(rx) => rx.recv().await,
-                    None => std::future::pending().await,
+            output = async {
+                if state.output_streams.is_empty() {
+                    std::future::pending().await
+                } else {
+                    state.output_streams.next().await
                 }
             } => {
-                let response = output_event_to_response(event);
-                if write_message_async::<Response>(&mut stream, &response).await.is_err() {
-                    break;
+                if let Some((_session_id, event)) = output {
+                    let response = output_event_to_response(event);
+                    if write_message_async::<Response>(&mut stream, &response).await.is_err() {
+                        break;
+                    }
                 }
             }
         }
@@ -88,15 +105,17 @@ async fn cleanup(state: &mut ClientState) {
     for session_id in state.attached_sessions.drain() {
         manager().remove_session_subscriber(session_id).await;
     }
-    state.output_tx.take();
-    state.output_rx.take();
+    state.output_streams.clear();
 }
 
 async fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Option<Response> {
     // Require authentication first
     if !state.authenticated {
         return match req {
-            Request::Handshake { token, protocol_version } => {
+            Request::Handshake {
+                token,
+                protocol_version,
+            } => {
                 if protocol_version != PROTOCOL_VERSION {
                     return Some(Response::error(
                         seq,
@@ -120,16 +139,22 @@ async fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Opti
                     daemon_pid: std::process::id(),
                 })
             }
-            _ => Some(Response::error(seq, "NOT_AUTHENTICATED", "Send Handshake first")),
+            _ => Some(Response::error(
+                seq,
+                "NOT_AUTHENTICATED",
+                "Send Handshake first",
+            )),
         };
     }
 
     let mgr = manager();
 
     match req {
-        Request::Handshake { .. } => {
-            Some(Response::error(seq, "ALREADY_AUTHENTICATED", "Already authenticated"))
-        }
+        Request::Handshake { .. } => Some(Response::error(
+            seq,
+            "ALREADY_AUTHENTICATED",
+            "Already authenticated",
+        )),
 
         Request::Create { options } => match mgr.create(options).await {
             Ok(id) => Some(Response::ok_session(seq, id)),
@@ -148,15 +173,17 @@ async fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Opti
             };
 
             if state.attached_sessions.insert(session) {
-                let tx = ensure_output_channel(state);
+                let tx = add_session_output_channel(state, session);
                 match mgr.add_session_subscriber(session, tx).await {
                     Ok(_) => {}
                     Err(Error::Session(msg)) if msg.contains("already attached") => {
                         state.attached_sessions.remove(&session);
+                        state.output_streams.remove(&session);
                         return Some(Response::error(seq, "ALREADY_ATTACHED", msg));
                     }
                     Err(e) => {
                         state.attached_sessions.remove(&session);
+                        state.output_streams.remove(&session);
                         return Some(Response::error(seq, e.code(), e.to_string()));
                     }
                 }
@@ -169,16 +196,15 @@ async fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Opti
         Request::Detach { session } => {
             if state.attached_sessions.remove(&session) {
                 mgr.remove_session_subscriber(session).await;
+                state.output_streams.remove(&session);
             }
             Some(Response::ok_session(seq, session))
         }
 
-        Request::Kill { session } => {
-            match mgr.kill(session).await {
-                Ok(_) => Some(Response::ok_session(seq, session)),
-                Err(e) => Some(Response::error(seq, e.code(), e.to_string())),
-            }
-        }
+        Request::Kill { session } => match mgr.kill(session).await {
+            Ok(_) => Some(Response::ok_session(seq, session)),
+            Err(e) => Some(Response::error(seq, e.code(), e.to_string())),
+        },
 
         Request::KillAll => {
             let count = mgr.kill_all().await;
@@ -199,29 +225,29 @@ async fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Opti
             }
         }
 
-        Request::Resize { session, cols, rows } => {
+        Request::Resize {
+            session,
+            cols,
+            rows,
+        } => {
             match mgr.resize(session, cols, rows).await {
                 Ok(_) => None, // No response for resize
                 Err(e) => Some(Response::error(seq, e.code(), e.to_string())),
             }
         }
 
-        Request::Signal { session, signal } => {
-            match mgr.signal(session, &signal).await {
-                Ok(_) => Some(Response::ok_session(seq, session)),
-                Err(Error::Session(msg)) if msg.starts_with("unknown signal") => {
-                    Some(Response::error(seq, "INVALID_SIGNAL", msg))
-                }
-                Err(e) => Some(Response::error(seq, e.code(), e.to_string())),
+        Request::Signal { session, signal } => match mgr.signal(session, &signal).await {
+            Ok(_) => Some(Response::ok_session(seq, session)),
+            Err(Error::Session(msg)) if msg.starts_with("unknown signal") => {
+                Some(Response::error(seq, "INVALID_SIGNAL", msg))
             }
-        }
+            Err(e) => Some(Response::error(seq, e.code(), e.to_string())),
+        },
 
-        Request::ClearScrollback { session } => {
-            match mgr.clear_scrollback(session).await {
-                Ok(_) => Some(Response::ok_session(seq, session)),
-                Err(e) => Some(Response::error(seq, e.code(), e.to_string())),
-            }
-        }
+        Request::ClearScrollback { session } => match mgr.clear_scrollback(session).await {
+            Ok(_) => Some(Response::ok_session(seq, session)),
+            Err(e) => Some(Response::error(seq, e.code(), e.to_string())),
+        },
 
         Request::Ack { .. } => {
             // ACK is no longer needed with tokio bounded channels
@@ -237,11 +263,36 @@ mod tests {
     use crate::protocol::CreateOptions;
 
     #[tokio::test]
+    async fn one_session_queue_full_must_not_block_other_session() {
+        let mut state = ClientState::default();
+
+        let tx1 = add_session_output_channel(&mut state, 1);
+        let tx2 = add_session_output_channel(&mut state, 2);
+
+        for _ in 0..config().flow_max_queue_size {
+            tx1.try_send(OutputEvent::Data {
+                session: 1,
+                data: b"x".to_vec(),
+            })
+            .expect("session 1 queue should accept filler event");
+        }
+
+        assert!(
+            tx2.try_send(OutputEvent::Data {
+                session: 2,
+                data: b"y".to_vec(),
+            })
+            .is_ok(),
+            "session 2 queue must stay writable even if session 1 queue is full"
+        );
+    }
+
+    #[tokio::test]
     async fn multiple_session_channels_remain_active() {
         let mut state = ClientState::default();
 
-        let tx1 = ensure_output_channel(&mut state);
-        let tx2 = ensure_output_channel(&mut state);
+        let tx1 = add_session_output_channel(&mut state, 1);
+        let tx2 = add_session_output_channel(&mut state, 2);
 
         let event1 = OutputEvent::Data {
             session: 1,
@@ -261,9 +312,8 @@ mod tests {
             "session 2 sender should stay connected"
         );
 
-        let rx = state.output_rx.as_mut().expect("output receiver must exist");
-        let first = rx.recv().await.expect("first event");
-        let second = rx.recv().await.expect("second event");
+        let (_first_stream, first) = state.output_streams.next().await.expect("first event");
+        let (_second_stream, second) = state.output_streams.next().await.expect("second event");
 
         let mut sessions = vec![];
         for event in [first, second] {
@@ -296,17 +346,29 @@ mod tests {
         let mut other = ClientState::default();
         other.authenticated = true;
 
-        let owner_attach = handle_request(&mut owner, 1, Request::Attach { session: session_id })
-            .await
-            .expect("owner attach response");
+        let owner_attach = handle_request(
+            &mut owner,
+            1,
+            Request::Attach {
+                session: session_id,
+            },
+        )
+        .await
+        .expect("owner attach response");
         assert!(
             matches!(owner_attach, Response::Ok { .. }),
             "owner must attach successfully"
         );
 
-        let other_attach = handle_request(&mut other, 2, Request::Attach { session: session_id })
-            .await
-            .expect("other attach response");
+        let other_attach = handle_request(
+            &mut other,
+            2,
+            Request::Attach {
+                session: session_id,
+            },
+        )
+        .await
+        .expect("other attach response");
         match other_attach {
             Response::Error { code, .. } => assert_eq!(code, "ALREADY_ATTACHED"),
             resp => panic!("expected ALREADY_ATTACHED, got {:?}", resp),
@@ -337,9 +399,15 @@ mod tests {
         let mut other = ClientState::default();
         other.authenticated = true;
 
-        let owner_attach = handle_request(&mut owner, 1, Request::Attach { session: session_id })
-            .await
-            .expect("owner attach response");
+        let owner_attach = handle_request(
+            &mut owner,
+            1,
+            Request::Attach {
+                session: session_id,
+            },
+        )
+        .await
+        .expect("owner attach response");
         assert!(
             matches!(owner_attach, Response::Ok { .. }),
             "owner must attach successfully"
@@ -347,9 +415,15 @@ mod tests {
 
         cleanup(&mut owner).await;
 
-        let other_attach = handle_request(&mut other, 2, Request::Attach { session: session_id })
-            .await
-            .expect("other attach response");
+        let other_attach = handle_request(
+            &mut other,
+            2,
+            Request::Attach {
+                session: session_id,
+            },
+        )
+        .await
+        .expect("other attach response");
         assert!(
             matches!(other_attach, Response::Ok { .. }),
             "session should be attachable after cleanup"
