@@ -301,8 +301,7 @@ export RUST_PTY_FLOW_RED_INTERVAL_MS=50
 import { createClient } from "@vibest/pty-daemon";
 
 const client = createClient({
-  socketPath: "/tmp/rust-pty.sock",
-  autoStart: true,
+  socketPath: `${process.env.HOME}/.vibest/pty/socket`,
 });
 
 await client.waitForConnection();

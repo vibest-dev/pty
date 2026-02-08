@@ -3,7 +3,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createClient } from "../src/client";
+import { createPtyClient } from "../src/client";
 import { FrameParser, encodeFrame } from "../src/frame";
 
 const sockets: string[] = [];
@@ -84,7 +84,7 @@ describe("PtyDaemonClient handshake", () => {
       server.listen(socketPath, resolve);
     });
 
-    const client = createClient({
+    const client = createPtyClient({
       socketPath,
       token: "token-1",
       protocolVersion: 1,
@@ -134,7 +134,7 @@ describe("PtyDaemonClient handshake", () => {
       server.listen(socketPath, resolve);
     });
 
-    const client = createClient({
+    const client = createPtyClient({
       socketPath,
       token: "token-1",
       protocolVersion: 1,

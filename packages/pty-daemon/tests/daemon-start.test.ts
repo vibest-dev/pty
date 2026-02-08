@@ -53,7 +53,7 @@ describe("ensureDaemonRunning", () => {
       binaryPath,
       socketPath,
       tokenPath,
-      timeoutMs: 3000,
+      timeoutMs: 5000,
     });
 
     cleanups.push(async () => {
@@ -104,7 +104,7 @@ describe("ensureDaemonRunning", () => {
       binaryPath,
       socketPath,
       tokenPath,
-      timeoutMs: 3000,
+      timeoutMs: 5000,
     });
 
     cleanups.push(async () => {

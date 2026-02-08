@@ -191,7 +191,7 @@ Request::Input { session, data }
 Request::Resize { session, cols, rows }
 Request::Kill { session }
 Request::Signal { session, signal }
-// Request::Ack - 已移除
+Request::Ack { session, count } // 协议兼容保留，当前 daemon 侧 no-op
 
 // 响应/事件
 Response::Output { session, data }
@@ -362,7 +362,7 @@ bun run test:e2e
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `RUST_PTY_SOCKET_PATH` | `/tmp/rust-pty.sock` | Unix socket 路径 |
+| `RUST_PTY_SOCKET_PATH` | `$HOME/.vibest/pty/socket` | Unix socket 路径 |
 | `RUST_PTY_MAX_CONNECTIONS` | `100` | 最大连接数 |
 | `RUST_PTY_MAX_SESSIONS` | `100` | 最大会话数 |
 | `RUST_PTY_SCROLLBACK_LINES` | `1000` | 滚动缓冲区行数 |
@@ -379,7 +379,7 @@ bun run test:e2e
 ```typescript
 import { createClient } from "@vibest/pty-daemon";
 
-const client = createClient({ socketPath: "/tmp/rust-pty.sock" });
+const client = createClient({ socketPath: `${process.env.HOME}/.vibest/pty/socket` });
 await client.waitForConnection();
 
 // 创建会话

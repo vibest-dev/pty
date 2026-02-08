@@ -23,6 +23,8 @@
     "check:release": "bun run dist -- --mock-binaries && bunx publint dist/@vibest/pty-daemon --pack bun",
     "publish:packages": "bun scripts/publish.ts",
     "publish:packages:dry": "bun scripts/publish.ts --dry-run --mock-binaries",
+    "publish:sdk": "turbo run publish:sdk --filter=@vibest/pty-daemon",
+    "publish:sdk:dry": "turbo run publish:sdk:dry --filter=@vibest/pty-daemon",
     "daemon": "./target/release/vibest-pty-daemon"
   },
   "dependencies": {

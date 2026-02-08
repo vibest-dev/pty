@@ -4,6 +4,8 @@
   "type": "module",
   "scripts": {
     "dev": "bun run server.ts",
+    "server": "bun run server.ts",
+    "client": "bun run client.ts",
     "build": "bun build public/main.ts --outdir public/dist"
   },
   "dependencies": {

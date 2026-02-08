@@ -1,7 +1,8 @@
-import { createPtyClient, type PtyDaemonClient } from "@vibest/pty-daemon";
+import { createPty, type PtyDaemonClient } from "@vibest/pty-daemon";
 
-const SOCKET_PATH = process.env.RUST_PTY_SOCKET_PATH || "/tmp/rust-pty.sock";
-const TOKEN_PATH = process.env.RUST_PTY_TOKEN_PATH || "/tmp/rust-pty.token";
+const DEFAULT_BASE_DIR = `${process.env.HOME || "/tmp"}/.vibest/pty`;
+const SOCKET_PATH = process.env.RUST_PTY_SOCKET_PATH || `${DEFAULT_BASE_DIR}/socket`;
+const TOKEN_PATH = process.env.RUST_PTY_TOKEN_PATH || `${DEFAULT_BASE_DIR}/token`;
 const PROTOCOL_VERSION = 1;
 
 type CommandName =
@@ -30,26 +31,23 @@ function usage(): string {
 }
 
 async function createConnectedClient(): Promise<PtyDaemonClient> {
-  const client = createPtyClient({
+  const pty = createPty({
     socketPath: SOCKET_PATH,
     tokenPath: TOKEN_PATH,
     protocolVersion: PROTOCOL_VERSION,
-    autoStart: false,
   });
-
-  await client.waitForConnection();
-  await client.handshake();
-  return client;
+  await pty.daemon.connect();
+  return pty.client;
 }
 
 function sendResize(client: PtyDaemonClient, sessionId: number): void {
   const cols = process.stdout.columns || 80;
   const rows = process.stdout.rows || 24;
-  client.resize(sessionId, cols, rows);
+  client.resize({ id: sessionId }, cols, rows);
 }
 
 async function attachInteractive(client: PtyDaemonClient, sessionId: number): Promise<number> {
-  const attached = await client.attach(sessionId);
+  const attached = await client.attach({ id: sessionId });
   const { snapshot } = attached;
 
   if (snapshot.rehydrate) {
@@ -103,7 +101,7 @@ async function attachInteractive(client: PtyDaemonClient, sessionId: number): Pr
     };
 
     const onStdin = (data: Buffer): void => {
-      client.input(sessionId, new Uint8Array(data));
+      client.write({ id: sessionId }, new Uint8Array(data));
     };
 
     const onSigwinch = (): void => {

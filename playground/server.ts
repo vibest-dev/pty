@@ -1,15 +1,19 @@
 import {
-  createPtyClient,
+  createPty,
   type PtyDaemonClient,
   type SessionInfo,
 } from "@vibest/pty-daemon";
 import { existsSync, mkdirSync, unlinkSync } from "fs";
 import { readFile, writeFile } from "fs/promises";
-import { dirname, join, resolve } from "path";
-import { fileURLToPath } from "url";
+import { join, resolve } from "path";
 
-const SOCKET_PATH = process.env.RUST_PTY_SOCKET_PATH || "/tmp/rust-pty.sock";
-const TOKEN_PATH = process.env.RUST_PTY_TOKEN_PATH || "/tmp/rust-pty.token";
+const DEFAULT_BASE_DIR = `${process.env.HOME || "/tmp"}/.vibest/pty`;
+const SOCKET_PATH = process.env.RUST_PTY_SOCKET_PATH || `${DEFAULT_BASE_DIR}/socket`;
+const TOKEN_PATH = process.env.RUST_PTY_TOKEN_PATH || `${DEFAULT_BASE_DIR}/token`;
+const LOCAL_DAEMON_BINARY_PATH = resolve(import.meta.dir, "..", "target", "release", "vibest-pty-daemon");
+const DAEMON_BINARY_PATH =
+  process.env.PTY_DAEMON_PATH ||
+  (existsSync(LOCAL_DAEMON_BINARY_PATH) ? LOCAL_DAEMON_BINARY_PATH : undefined);
 const PROTOCOL_VERSION = 1;
 const PORT = Number(process.env.PORT || 3000);
 const HISTORY_DIR = process.env.RUST_PTY_HISTORY_DIR || "/tmp/.vibest/pty-history";
@@ -17,12 +21,6 @@ const MAX_HISTORY_BYTES = 5 * 1024 * 1024;
 const MAX_ATTACH_HISTORY_BYTES = 512 * 1024;
 const HISTORY_FLUSH_INTERVAL_MS = 200;
 const CLEAR_SCROLLBACK_SEQUENCE = Buffer.from([0x1b, 0x5b, 0x33, 0x4a]);
-const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const LOCAL_DAEMON_BINARIES = [
-  join(REPO_ROOT, "target", "release", "vibest-pty-daemon"),
-  join(REPO_ROOT, "target", "debug", "vibest-pty-daemon"),
-];
-const AUTO_START_DAEMON = process.env.PTY_DAEMON_AUTOSTART !== "0";
 
 mkdirSync(HISTORY_DIR, { recursive: true, mode: 0o700 });
 
@@ -44,20 +42,6 @@ interface HistoryState {
 }
 
 const historyStates = new Map<number, HistoryState>();
-
-function resolveDaemonBinaryPath(): string | undefined {
-  if (process.env.PTY_DAEMON_PATH) {
-    return process.env.PTY_DAEMON_PATH;
-  }
-
-  for (const candidate of LOCAL_DAEMON_BINARIES) {
-    if (existsSync(candidate)) {
-      return candidate;
-    }
-  }
-
-  return undefined;
-}
 
 function historyFilePath(sessionId: number): string {
   return join(HISTORY_DIR, `session-${sessionId}.bin`);
@@ -250,7 +234,7 @@ interface ClientContext {
 }
 
 const clients = new Map<any, ClientContext>();
-let sharedDaemon: PtyDaemonClient | null = null;
+let sharedPty: ReturnType<typeof createPty> | null = null;
 
 function broadcastOutput(session: number, data: Uint8Array): void {
   appendHistory(session, data);
@@ -288,39 +272,36 @@ function wireDaemonEvents(daemon: PtyDaemonClient): void {
   });
 
   daemon.on("close", () => {
-    if (sharedDaemon === daemon) {
-      sharedDaemon = null;
+    if (sharedPty?.client === daemon) {
+      sharedPty = null;
     }
   });
 }
 
 async function getSharedDaemon(): Promise<PtyDaemonClient> {
-  if (sharedDaemon?.isConnected) {
-    return sharedDaemon;
+  if (!sharedPty) {
+    const pty = createPty({
+      socketPath: SOCKET_PATH,
+      tokenPath: TOKEN_PATH,
+      protocolVersion: PROTOCOL_VERSION,
+      daemon: {
+        binaryPath: DAEMON_BINARY_PATH,
+      },
+    });
+    wireDaemonEvents(pty.client);
+    sharedPty = pty;
   }
 
-  if (sharedDaemon) {
-    sharedDaemon.removeAllListeners();
-    sharedDaemon.close();
-    sharedDaemon = null;
+  try {
+    await sharedPty.daemon.connect();
+  } catch (error) {
+    sharedPty.client.removeAllListeners();
+    sharedPty.client.close();
+    sharedPty = null;
+    throw error;
   }
 
-  const binaryPath = resolveDaemonBinaryPath();
-  const daemon = createPtyClient({
-    socketPath: SOCKET_PATH,
-    tokenPath: TOKEN_PATH,
-    protocolVersion: PROTOCOL_VERSION,
-    autoStart: AUTO_START_DAEMON,
-    daemon: {
-      ...(binaryPath ? { binaryPath } : {}),
-      timeoutMs: 5000,
-    },
-  });
-
-  await daemon.waitForConnection();
-  wireDaemonEvents(daemon);
-  sharedDaemon = daemon;
-  return daemon;
+  return sharedPty.client;
 }
 
 async function handleWebSocketMessage(ws: any, ctx: ClientContext, msg: WebSocketMessage): Promise<void> {
@@ -342,7 +323,7 @@ async function handleWebSocketMessage(ws: any, ctx: ClientContext, msg: WebSocke
       }
 
       case "attach": {
-        const { snapshot } = await daemon.attach(msg.session);
+        const { snapshot } = await daemon.attach({ id: msg.session });
         const history = await readHistoryTail(msg.session);
         const historyBase64 = history ? history.toString("base64") : undefined;
         ctx.attachedSessions.add(msg.session);
@@ -360,12 +341,12 @@ async function handleWebSocketMessage(ws: any, ctx: ClientContext, msg: WebSocke
 
       case "input": {
         const data = Uint8Array.from(Buffer.from(msg.data, "base64"));
-        daemon.input(msg.session, data);
+        daemon.write({ id: msg.session }, data);
         break;
       }
 
       case "resize": {
-        daemon.resize(msg.session, msg.cols, msg.rows);
+        daemon.resize({ id: msg.session }, msg.cols, msg.rows);
         break;
       }
     }
