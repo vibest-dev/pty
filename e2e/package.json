@@ -3,10 +3,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "bun run test:daemon && bun run test:sdk",
+    "test": "bun run test:daemon && bun run test:sdk && bun run test:flow-control",
     "test:e2e": "bun run test",
     "test:daemon": "bun test e2e.test.ts",
-    "test:sdk": "bunx vitest --run layout.test.ts postinstall.test.ts"
+    "test:sdk": "bunx vitest --run layout.test.ts postinstall.test.ts",
+    "test:flow-control": "bunx vitest --run flow-control.integration.test.ts"
   },
   "dependencies": {
     "@vibest/pty-daemon": "workspace:*"

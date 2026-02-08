@@ -120,7 +120,32 @@ export async function stopDaemon(child: ChildProcess | null | undefined): Promis
   }
 
   await new Promise<void>((resolve) => {
-    child.once("exit", () => resolve());
+    let finished = false;
+    const finish = (): void => {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      resolve();
+    };
+
+    const termTimer = setTimeout(() => {
+      if (child.exitCode === null) {
+        child.kill("SIGKILL");
+      }
+
+      const killTimer = setTimeout(() => finish(), 1000);
+      child.once("exit", () => {
+        clearTimeout(killTimer);
+        finish();
+      });
+    }, 2000);
+
+    child.once("exit", () => {
+      clearTimeout(termTimer);
+      finish();
+    });
+
     child.kill("SIGTERM");
   });
 }

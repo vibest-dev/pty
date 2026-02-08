@@ -69,10 +69,6 @@ impl PtyHandle {
             Err(io::Error::last_os_error())
         }
     }
-
-    pub fn close(&self) {
-        unsafe { libc::close(self.master_fd) };
-    }
 }
 
 unsafe fn spawn_child(
@@ -154,20 +150,4 @@ unsafe fn spawn_child(
     }
 
     libc::_exit(1);
-}
-
-pub fn parse_signal(signal: &str) -> Option<i32> {
-    match signal.to_uppercase().as_str() {
-        "SIGINT" | "INT" | "2" => Some(libc::SIGINT),
-        "SIGTERM" | "TERM" | "15" => Some(libc::SIGTERM),
-        "SIGKILL" | "KILL" | "9" => Some(libc::SIGKILL),
-        "SIGHUP" | "HUP" | "1" => Some(libc::SIGHUP),
-        "SIGQUIT" | "QUIT" | "3" => Some(libc::SIGQUIT),
-        "SIGUSR1" | "USR1" | "10" => Some(libc::SIGUSR1),
-        "SIGUSR2" | "USR2" | "12" => Some(libc::SIGUSR2),
-        "SIGCONT" | "CONT" | "18" => Some(libc::SIGCONT),
-        "SIGSTOP" | "STOP" | "19" => Some(libc::SIGSTOP),
-        "SIGTSTP" | "TSTP" | "20" => Some(libc::SIGTSTP),
-        _ => None,
-    }
 }

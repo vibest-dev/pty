@@ -11705,7 +11705,6 @@ function connect() {
   };
 }
 function send(msg) {
-  console.log("[ui] Sending:", msg);
   if (!ws2 || ws2.readyState !== WebSocket.OPEN) {
     console.error("[ui] WebSocket not connected, readyState:", ws2?.readyState);
     return;
@@ -11941,7 +11940,6 @@ function updateStatus() {
   setStatus(`Sessions: ${count}${active}`);
 }
 newTabBtn.addEventListener("click", () => {
-  console.log("[ui] New tab clicked, sending create...");
   send({ type: "create" });
 });
 var handleWindowResize = debounce(() => {

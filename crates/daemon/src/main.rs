@@ -9,10 +9,8 @@ use config::config;
 use server::handle_connection;
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-
-static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 #[tokio::main]
 async fn main() {
@@ -48,6 +46,11 @@ async fn main() {
         return;
     }
 
+    if let Err(e) = listener.set_nonblocking(true) {
+        eprintln!("[daemon] Failed to set listener nonblocking mode: {}", e);
+        return;
+    }
+
     if let Err(e) = fs::set_permissions(&cfg.socket_path, fs::Permissions::from_mode(0o600)) {
         eprintln!("[daemon] Warning: failed to set socket permissions: {}", e);
     }
@@ -57,10 +60,10 @@ async fn main() {
         eprintln!("[daemon] Warning: failed to write PID file: {}", e);
     }
 
-    // Install async signal handlers
-    tokio::spawn(async {
-        install_signal_handlers().await;
-    });
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigint = signal(SignalKind::interrupt()).expect("Failed to install SIGINT handler");
+    let mut sigterm = signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
+    let mut sighup = signal(SignalKind::hangup()).expect("Failed to install SIGHUP handler");
 
     eprintln!("[daemon] Listening on {}", cfg.socket_path);
     eprintln!("[daemon] PID: {}", std::process::id());
@@ -71,25 +74,41 @@ async fn main() {
     let listener = tokio::net::UnixListener::from_std(listener).expect("Failed to convert listener");
 
     // Async accept loop - no polling needed!
-    while !SHUTDOWN.load(Ordering::Relaxed) {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, _)) => {
+                        let count = active.fetch_add(1, Ordering::SeqCst) + 1;
 
-                if count > cfg.max_connections {
-                    active.fetch_sub(1, Ordering::SeqCst);
-                    eprintln!("[daemon] Connection limit reached, rejecting");
-                    continue;
+                        if count > cfg.max_connections {
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            eprintln!("[daemon] Connection limit reached, rejecting");
+                            continue;
+                        }
+
+                        let active = Arc::clone(&active);
+                        tokio::spawn(async move {
+                            handle_connection(stream).await;
+                            active.fetch_sub(1, Ordering::SeqCst);
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("[daemon] Accept error: {}", e);
+                    }
                 }
-
-                let active = Arc::clone(&active);
-                tokio::spawn(async move {
-                    handle_connection(stream).await;
-                    active.fetch_sub(1, Ordering::SeqCst);
-                });
             }
-            Err(e) => {
-                eprintln!("[daemon] Accept error: {}", e);
+            _ = sigint.recv() => {
+                eprintln!("[daemon] Received SIGINT, shutting down...");
+                break;
+            }
+            _ = sigterm.recv() => {
+                eprintln!("[daemon] Received SIGTERM, shutting down...");
+                break;
+            }
+            _ = sighup.recv() => {
+                eprintln!("[daemon] Received SIGHUP, shutting down...");
+                break;
             }
         }
     }
@@ -114,29 +133,6 @@ fn prepare_socket(path: &str) -> std::io::Result<()> {
         Err(e) => return Err(e),
     }
     Ok(())
-}
-
-async fn install_signal_handlers() {
-    use tokio::signal::unix::{signal, SignalKind};
-
-    let mut sigint = signal(SignalKind::interrupt()).expect("Failed to install SIGINT handler");
-    let mut sigterm = signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
-    let mut sighup = signal(SignalKind::hangup()).expect("Failed to install SIGHUP handler");
-
-    tokio::select! {
-        _ = sigint.recv() => {
-            eprintln!("[daemon] Received SIGINT, shutting down...");
-            SHUTDOWN.store(true, Ordering::SeqCst);
-        }
-        _ = sigterm.recv() => {
-            eprintln!("[daemon] Received SIGTERM, shutting down...");
-            SHUTDOWN.store(true, Ordering::SeqCst);
-        }
-        _ = sighup.recv() => {
-            eprintln!("[daemon] Received SIGHUP, shutting down...");
-            SHUTDOWN.store(true, Ordering::SeqCst);
-        }
-    }
 }
 
 fn cleanup() {

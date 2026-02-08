@@ -24,8 +24,8 @@
   ],
   "scripts": {
     "build": "tsdown",
-    "test:sdk": "vitest --run tests",
-    "test": "vitest --run"
+    "test:sdk": "bun run build && vitest --run tests",
+    "test": "bun run build && vitest --run"
   },
   "dependencies": {
     "@msgpack/msgpack": "^3.0.0"

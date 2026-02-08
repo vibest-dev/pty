@@ -6,7 +6,6 @@
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import {
   createClient,
@@ -40,7 +39,7 @@ async function createAuthedClient(): Promise<PtyDaemonClient> {
 
 describe("PTY Daemon E2E via SDK", () => {
   beforeAll(async () => {
-    tempDir = mkdtempSync(path.join(os.tmpdir(), "pty-sdk-e2e-"));
+    tempDir = mkdtempSync(path.join("/tmp", "pty-sdk-e2e-"));
     socketPath = path.join(tempDir, "daemon.sock");
     tokenPath = path.join(tempDir, "daemon.token");
 
@@ -144,10 +143,9 @@ describe("PTY Daemon E2E via SDK", () => {
       autoStart: false,
       protocolVersion: PROTOCOL_VERSION,
     });
-    await invalidTokenClient.waitForConnection();
     try {
-      await invalidTokenClient.handshake();
-      throw new Error("Expected handshake with invalid token to fail");
+      await invalidTokenClient.waitForConnection();
+      throw new Error("Expected connection with invalid token to fail");
     } catch (error) {
       expect(error).toBeInstanceOf(DaemonError);
       if (error instanceof DaemonError) {
@@ -163,10 +161,9 @@ describe("PTY Daemon E2E via SDK", () => {
       autoStart: false,
       protocolVersion: 999,
     });
-    await protocolMismatchClient.waitForConnection();
     try {
-      await protocolMismatchClient.handshake();
-      throw new Error("Expected protocol mismatch handshake to fail");
+      await protocolMismatchClient.waitForConnection();
+      throw new Error("Expected protocol mismatch connection to fail");
     } catch (error) {
       expect(error).toBeInstanceOf(DaemonError);
       if (error instanceof DaemonError) {
