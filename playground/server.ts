@@ -18,7 +18,10 @@ const MAX_ATTACH_HISTORY_BYTES = 512 * 1024;
 const HISTORY_FLUSH_INTERVAL_MS = 200;
 const CLEAR_SCROLLBACK_SEQUENCE = Buffer.from([0x1b, 0x5b, 0x33, 0x4a]);
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const LOCAL_DAEMON_BINARY = join(REPO_ROOT, "target", "release", "vibest-pty-daemon");
+const LOCAL_DAEMON_BINARIES = [
+  join(REPO_ROOT, "target", "release", "vibest-pty-daemon"),
+  join(REPO_ROOT, "target", "debug", "vibest-pty-daemon"),
+];
 const AUTO_START_DAEMON = process.env.PTY_DAEMON_AUTOSTART !== "0";
 
 mkdirSync(HISTORY_DIR, { recursive: true, mode: 0o700 });
@@ -47,8 +50,10 @@ function resolveDaemonBinaryPath(): string | undefined {
     return process.env.PTY_DAEMON_PATH;
   }
 
-  if (existsSync(LOCAL_DAEMON_BINARY)) {
-    return LOCAL_DAEMON_BINARY;
+  for (const candidate of LOCAL_DAEMON_BINARIES) {
+    if (existsSync(candidate)) {
+      return candidate;
+    }
   }
 
   return undefined;

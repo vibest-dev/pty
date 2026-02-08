@@ -122,31 +122,48 @@ describe("Flow Control Integration", () => {
     }
   });
 
-  test("delivers output to multiple subscribers under sustained load", async () => {
+  test("delivers output to multiple clients across sessions under sustained load", async () => {
     if (!producer || !slowSubscriber || !fastSubscriber) {
       throw new Error("clients are not initialized");
     }
+
+    const createdSecondary = await producer.create({
+      shell: "/bin/sh",
+      cols: 80,
+      rows: 24,
+    });
+    const secondarySessionId = createdSecondary.session;
 
     let slowOutputs = 0;
     let fastOutputs = 0;
     const warnings: BackpressureWarningEvent[] = [];
 
-    slowSubscriber.on("output", () => {
-      slowOutputs += 1;
+    slowSubscriber.on("output", (event) => {
+      if (event.session === sessionId) {
+        slowOutputs += 1;
+      }
     });
-    fastSubscriber.on("output", () => {
-      fastOutputs += 1;
+    fastSubscriber.on("output", (event) => {
+      if (event.session === secondarySessionId) {
+        fastOutputs += 1;
+      }
     });
     slowSubscriber.on("backpressure_warning", (event) => {
-      warnings.push(event);
+      if (event.session === sessionId) {
+        warnings.push(event);
+      }
     });
 
     await slowSubscriber.attach(sessionId);
-    await fastSubscriber.attach(sessionId);
+    await fastSubscriber.attach(secondarySessionId);
 
     producer.write(
       sessionId,
       new TextEncoder().encode("for i in $(seq 1 4000); do echo flow-$i; done\n"),
+    );
+    producer.write(
+      secondarySessionId,
+      new TextEncoder().encode("for i in $(seq 1 4000); do echo fast-$i; done\n"),
     );
 
     await sleep(1500);
@@ -156,6 +173,8 @@ describe("Flow Control Integration", () => {
     for (const warning of warnings) {
       expect(["yellow", "red"]).toContain(warning.level);
     }
+
+    await producer.kill(secondarySessionId);
   }, 10000);
 
   test("exposes manual ACK flow-control state for slow consumers", async () => {

@@ -50,6 +50,11 @@ enum Request {
     Detach {
         session: u32,
     },
+    Input {
+        session: u32,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+    },
     Kill {
         session: u32,
     },
@@ -248,6 +253,27 @@ impl TestClient {
             }
             Err(err) => panic!("Failed to read response: {}", err),
         }
+    }
+
+    fn try_recv(&mut self) -> Option<Response> {
+        let mut len_buf = [0u8; 4];
+        match self.stream.read_exact(&mut len_buf) {
+            Ok(_) => {}
+            Err(err) => match err.kind() {
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => return None,
+                _ => panic!("Failed to read frame length: {}", err),
+            },
+        }
+        let len = u32::from_be_bytes(len_buf) as usize;
+
+        let mut payload = vec![0u8; len];
+        self.stream.read_exact(&mut payload).unwrap();
+
+        Some(from_slice(&payload).unwrap())
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) {
+        self.stream.set_read_timeout(timeout).unwrap();
     }
 
     fn authenticate(&mut self) {
@@ -620,6 +646,75 @@ mod integration_tests {
     }
 
     #[test]
+    fn test_single_client_attach_multiple_sessions_receives_both_streams() {
+        let daemon = TestDaemon::start();
+        let mut client = daemon.client();
+        client.authenticate();
+
+        let create_session = |client: &mut TestClient| -> u32 {
+            client.send(&Request::Create {
+                cwd: None,
+                cols: Some(80),
+                rows: Some(24),
+                initial_commands: None,
+            });
+            match client.recv() {
+                Response::Ok { session, .. } => session.expect("session id"),
+                resp => panic!("Create failed: {:?}", resp),
+            }
+        };
+
+        let session1 = create_session(&mut client);
+        let session2 = create_session(&mut client);
+
+        for session in [session1, session2] {
+            client.send(&Request::Attach { session });
+            match client.recv() {
+                Response::Ok {
+                    session: Some(attached),
+                    ..
+                } => assert_eq!(attached, session),
+                resp => panic!("Attach failed: {:?}", resp),
+            }
+        }
+
+        client.send(&Request::Input {
+            session: session1,
+            data: b"printf '__S1__\\n'\n".to_vec(),
+        });
+        client.send(&Request::Input {
+            session: session2,
+            data: b"printf '__S2__\\n'\n".to_vec(),
+        });
+
+        client.set_read_timeout(Some(Duration::from_millis(300)));
+
+        let mut saw_session1 = false;
+        let mut saw_session2 = false;
+
+        for _ in 0..40 {
+            let Some(resp) = client.try_recv() else {
+                continue;
+            };
+            if let Response::Output { session, data } = resp {
+                let text = String::from_utf8_lossy(&data);
+                if session == session1 && text.contains("__S1__") {
+                    saw_session1 = true;
+                }
+                if session == session2 && text.contains("__S2__") {
+                    saw_session2 = true;
+                }
+                if saw_session1 && saw_session2 {
+                    break;
+                }
+            }
+        }
+
+        assert!(saw_session1, "missing output from session {}", session1);
+        assert!(saw_session2, "missing output from session {}", session2);
+    }
+
+    #[test]
     fn test_concurrent_clients() {
         let daemon = TestDaemon::start();
 
@@ -664,6 +759,43 @@ mod integration_tests {
                 assert_eq!(sessions.unwrap().len(), 5);
             }
             _ => panic!("List failed"),
+        }
+    }
+
+    #[test]
+    fn test_session_cannot_be_attached_by_multiple_clients() {
+        let daemon = TestDaemon::start();
+
+        let mut owner = daemon.client();
+        owner.authenticate();
+
+        owner.send(&Request::Create {
+            cwd: None,
+            cols: Some(80),
+            rows: Some(24),
+            initial_commands: None,
+        });
+        let session_id = match owner.recv() {
+            Response::Ok { session, .. } => session.expect("session id"),
+            resp => panic!("Create failed: {:?}", resp),
+        };
+
+        owner.send(&Request::Attach { session: session_id });
+        match owner.recv() {
+            Response::Ok {
+                session: Some(attached),
+                ..
+            } => assert_eq!(attached, session_id),
+            resp => panic!("Owner attach failed: {:?}", resp),
+        }
+
+        let mut other = daemon.client();
+        other.authenticate();
+        other.send(&Request::Attach { session: session_id });
+
+        match other.recv() {
+            Response::Error { code, .. } => assert_eq!(code, "ALREADY_ATTACHED"),
+            resp => panic!("Expected ALREADY_ATTACHED error, got {:?}", resp),
         }
     }
 }

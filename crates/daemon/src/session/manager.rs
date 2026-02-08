@@ -25,12 +25,6 @@ pub enum OutputEvent {
     },
 }
 
-// Simplified subscriber - just a channel sender
-struct SessionSubscriber {
-    id: u64,
-    tx: tokio::sync::mpsc::Sender<OutputEvent>,
-}
-
 // Simplified Session structure
 pub struct Session {
     pub id: u32,
@@ -73,8 +67,8 @@ impl Session {
 pub struct Manager {
     sessions: Arc<tokio::sync::RwLock<HashMap<u32, Arc<Session>>>>,
     next_id: AtomicU32,
-    next_sub_id: AtomicU32,
-    session_subscribers: Arc<tokio::sync::RwLock<HashMap<u32, Vec<SessionSubscriber>>>>,
+    // One subscriber per session (single-client attachment model).
+    session_subscribers: Arc<tokio::sync::RwLock<HashMap<u32, tokio::sync::mpsc::Sender<OutputEvent>>>>,
 }
 
 impl Manager {
@@ -82,7 +76,6 @@ impl Manager {
         Self {
             sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             next_id: AtomicU32::new(1),
-            next_sub_id: AtomicU32::new(1),
             session_subscribers: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         }
     }
@@ -92,29 +85,23 @@ impl Manager {
         &self,
         session_id: u32,
         tx: tokio::sync::mpsc::Sender<OutputEvent>,
-    ) -> Result<u64> {
+    ) -> Result<()> {
         if !self.sessions.read().await.contains_key(&session_id) {
             return Err(Error::NotFound(format!("session {}", session_id)));
         }
 
-        let id = self.next_sub_id.fetch_add(1, Ordering::SeqCst) as u64;
         let mut subs = self.session_subscribers.write().await;
-        subs.entry(session_id).or_default().push(SessionSubscriber {
-            id,
-            tx,
-        });
-        Ok(id)
+        if subs.contains_key(&session_id) {
+            return Err(Error::Session(format!("session {} already attached", session_id)));
+        }
+        subs.insert(session_id, tx);
+        Ok(())
     }
 
     /// Remove a subscriber for a specific session
-    pub async fn remove_session_subscriber(&self, session_id: u32, id: u64) {
+    pub async fn remove_session_subscriber(&self, session_id: u32) {
         let mut subs = self.session_subscribers.write().await;
-        if let Some(list) = subs.get_mut(&session_id) {
-            list.retain(|s| s.id != id);
-            if list.is_empty() {
-                subs.remove(&session_id);
-            }
-        }
+        subs.remove(&session_id);
     }
 
     /// Create a new PTY session
@@ -180,7 +167,8 @@ impl Manager {
     }
 
     pub async fn kill(&self, id: u32) -> Result<()> {
-        let session = self.sessions
+        let session = self
+            .sessions
             .read()
             .await
             .get(&id)
@@ -190,7 +178,8 @@ impl Manager {
     }
 
     pub async fn kill_all(&self) -> usize {
-        let sessions: Vec<(u32, Arc<Session>)> = self.sessions
+        let sessions: Vec<(u32, Arc<Session>)> = self
+            .sessions
             .read()
             .await
             .iter()
@@ -284,7 +273,7 @@ impl Manager {
 /// Async PTY reader task (replaces the blocking thread)
 async fn start_reader(
     session: Arc<Session>,
-    subscribers: Arc<tokio::sync::RwLock<HashMap<u32, Vec<SessionSubscriber>>>>,
+    subscribers: Arc<tokio::sync::RwLock<HashMap<u32, tokio::sync::mpsc::Sender<OutputEvent>>>>,
 ) {
     let master_fd = session.pty.master_fd;
     let session_id = session.id;
@@ -354,44 +343,42 @@ async fn start_reader(
 
 /// Helper to broadcast events
 async fn broadcast_to_subscribers(
-    subscribers: &Arc<tokio::sync::RwLock<HashMap<u32, Vec<SessionSubscriber>>>>,
+    subscribers: &Arc<tokio::sync::RwLock<HashMap<u32, tokio::sync::mpsc::Sender<OutputEvent>>>>,
     session_id: u32,
     event: OutputEvent,
 ) {
     let subs = subscribers.read().await;
-    let Some(list) = subs.get(&session_id) else {
+    let Some(tx) = subs.get(&session_id) else {
         return;
     };
 
     let cfg = config();
 
-    for sub in list {
-        match sub.tx.try_send(event.clone()) {
-            Ok(_) => {
-                let remaining = sub.tx.capacity();
-                if remaining < cfg.flow_threshold {
-                    let queue_size = cfg.flow_max_queue_size.saturating_sub(remaining);
-                    let warning = OutputEvent::BackpressureWarning {
-                        session: session_id,
-                        queue_size,
-                        level: BackpressureLevel::Yellow,
-                    };
-                    let _ = sub.tx.try_send(warning);
-                }
+    match tx.try_send(event) {
+        Ok(_) => {
+            let remaining = tx.capacity();
+            if remaining < cfg.flow_threshold {
+                let queue_size = cfg.flow_max_queue_size - remaining;
+                let warning = OutputEvent::BackpressureWarning {
+                    session: session_id,
+                    queue_size,
+                    level: BackpressureLevel::Yellow,
+                };
+                let _ = tx.try_send(warning);
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                if !cfg.flow_auto_disconnect {
-                    let warning = OutputEvent::BackpressureWarning {
-                        session: session_id,
-                        queue_size: cfg.flow_max_queue_size,
-                        level: BackpressureLevel::Red,
-                    };
-                    let _ = sub.tx.try_send(warning);
-                }
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            if !cfg.flow_auto_disconnect {
+                let warning = OutputEvent::BackpressureWarning {
+                    session: session_id,
+                    queue_size: cfg.flow_max_queue_size,
+                    level: BackpressureLevel::Red,
+                };
+                let _ = tx.try_send(warning);
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                // Subscriber disconnected
-            }
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            // Subscriber disconnected
         }
     }
 }
