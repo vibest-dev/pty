@@ -43,6 +43,10 @@ async fn main() {
             return;
         }
     };
+    if let Err(e) = listener.set_nonblocking(true) {
+        eprintln!("[daemon] Failed to set listener nonblocking: {}", e);
+        return;
+    }
 
     if let Err(e) = fs::set_permissions(&cfg.socket_path, fs::Permissions::from_mode(0o600)) {
         eprintln!("[daemon] Warning: failed to set socket permissions: {}", e);
