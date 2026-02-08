@@ -41,6 +41,10 @@ async fn main() {
             return;
         }
     };
+    if let Err(e) = listener.set_nonblocking(true) {
+        eprintln!("[daemon] Failed to set listener nonblocking: {}", e);
+        return;
+    }
 
     if let Err(e) = listener.set_nonblocking(true) {
         eprintln!("[daemon] Failed to set listener nonblocking mode: {}", e);
