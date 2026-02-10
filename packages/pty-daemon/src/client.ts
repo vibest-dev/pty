@@ -105,6 +105,7 @@ export type DaemonOkResponse = {
   session?: number;
   sessions?: SessionInfo[];
   snapshot?: Snapshot;
+  count?: number;
 };
 
 export type DaemonErrorResponse = {
@@ -383,7 +384,7 @@ export class PtyDaemonClient extends EventEmitter<PtyDaemonClientEvents> {
 
   async killAll(reqOptions?: RequestOptions): Promise<number> {
     const ok = this.unwrapOk(await this.requestRaw({ type: "kill_all" }, reqOptions));
-    return this.requireSession(ok);
+    return this.requireCount(ok);
   }
 
   write(session: Session, data: Uint8Array): void {
@@ -433,6 +434,13 @@ export class PtyDaemonClient extends EventEmitter<PtyDaemonClientEvents> {
       throw new Error("Protocol error: missing ok.snapshot");
     }
     return ok.snapshot;
+  }
+
+  private requireCount(ok: DaemonOkResponse): number {
+    if (typeof ok.count !== "number") {
+      throw new Error("Protocol error: missing ok.count");
+    }
+    return ok.count;
   }
 
   private async requestRaw(request: RequestNoSeq, options?: RequestOptions): Promise<ReplyMessage> {

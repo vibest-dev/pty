@@ -43,11 +43,6 @@ pub enum Request {
     ClearScrollback {
         session: u32,
     },
-    /// Client acknowledges processing N messages (optional flow control)
-    Ack {
-        session: u32,
-        count: usize,
-    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +73,7 @@ pub struct CreateOptions {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     Handshake {
+        seq: u32,
         protocol_version: u32,
         daemon_version: String,
         daemon_pid: u32,
@@ -90,6 +86,8 @@ pub enum Response {
         sessions: Option<Vec<SessionInfo>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         snapshot: Option<Snapshot>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        count: Option<u32>,
     },
     Error {
         seq: u32,
@@ -130,6 +128,7 @@ impl Response {
             session: Some(id),
             sessions: None,
             snapshot: None,
+            count: None,
         }
     }
 
@@ -139,6 +138,7 @@ impl Response {
             session: None,
             sessions: Some(list),
             snapshot: None,
+            count: None,
         }
     }
 
@@ -148,6 +148,7 @@ impl Response {
             session: Some(id),
             sessions: None,
             snapshot: Some(snapshot),
+            count: None,
         }
     }
 
@@ -162,9 +163,10 @@ impl Response {
     pub fn ok_count(seq: u32, count: usize) -> Self {
         Self::Ok {
             seq,
-            session: Some(count as u32),
+            session: None,
             sessions: None,
             snapshot: None,
+            count: Some(count as u32),
         }
     }
 }

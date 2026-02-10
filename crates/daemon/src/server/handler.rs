@@ -134,6 +134,7 @@ async fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Opti
                 state.authenticated = true;
 
                 Some(Response::Handshake {
+                    seq,
                     protocol_version: PROTOCOL_VERSION,
                     daemon_version: DAEMON_VERSION.into(),
                     daemon_pid: std::process::id(),
@@ -213,10 +214,14 @@ async fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Opti
 
         Request::Input { session, data } => {
             match mgr.get(session).await {
-                Some(sess) => {
-                    let _ = sess.pty.write(&data);
-                    None // No response for input
-                }
+                Some(sess) => match sess.pty.write(&data) {
+                    Ok(_) => Some(Response::ok_session(seq, session)),
+                    Err(e) => Some(Response::error(
+                        seq,
+                        "PTY_WRITE_FAILED",
+                        format!("Failed to write to PTY: {}", e),
+                    )),
+                },
                 None => Some(Response::error(
                     seq,
                     "NOT_FOUND",
@@ -231,7 +236,7 @@ async fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Opti
             rows,
         } => {
             match mgr.resize(session, cols, rows).await {
-                Ok(_) => None, // No response for resize
+                Ok(_) => Some(Response::ok_session(seq, session)),
                 Err(e) => Some(Response::error(seq, e.code(), e.to_string())),
             }
         }
@@ -248,12 +253,6 @@ async fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Opti
             Ok(_) => Some(Response::ok_session(seq, session)),
             Err(e) => Some(Response::error(seq, e.code(), e.to_string())),
         },
-
-        Request::Ack { .. } => {
-            // ACK is no longer needed with tokio bounded channels
-            // They handle backpressure automatically
-            None
-        }
     }
 }
 

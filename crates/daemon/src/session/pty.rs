@@ -58,7 +58,22 @@ impl PtyHandle {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        tcsetwinsize(fd, ws).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+        match tcsetwinsize(fd, ws) {
+            Ok(()) => Ok(()),
+            Err(master_err) => {
+                // Some platforms/drivers reject TIOCSWINSZ on the master PTY.
+                // Fall back to opening the slave PTY path and applying ioctl there.
+                self.resize_via_slave(cols, rows).map_err(|slave_err| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!(
+                            "master resize failed: {}; slave resize failed: {}",
+                            master_err, slave_err
+                        ),
+                    )
+                })
+            }
+        }
     }
 
     pub fn send_signal(&self, signal: i32) -> io::Result<()> {
@@ -68,6 +83,37 @@ impl PtyHandle {
         } else {
             Err(io::Error::last_os_error())
         }
+    }
+
+    fn resize_via_slave(&self, cols: u16, rows: u16) -> io::Result<()> {
+        let pts = CString::new(self.pts_path.as_str()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pts path contains interior null byte",
+            )
+        })?;
+
+        let slave_fd = unsafe { libc::open(pts.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
+        if slave_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let ws = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+
+        let ret = unsafe { libc::ioctl(slave_fd, libc::TIOCSWINSZ, &ws) };
+        let resize_result = if ret == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        };
+
+        let _ = unsafe { libc::close(slave_fd) };
+        resize_result
     }
 }
 
