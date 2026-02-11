@@ -81,6 +81,7 @@ struct RequestEnvelope {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Response {
     Handshake {
+        seq: u32,
         protocol_version: u32,
         daemon_version: String,
         daemon_pid: u32,
@@ -89,6 +90,7 @@ enum Response {
         seq: u32,
         session: Option<u32>,
         sessions: Option<Vec<SessionInfo>>,
+        count: Option<u32>,
     },
     Error {
         seq: u32,
@@ -288,7 +290,9 @@ impl TestClient {
         });
 
         match self.recv() {
-            Response::Handshake { .. } => {}
+            Response::Handshake { seq, .. } => {
+                assert_eq!(seq, 1);
+            }
             resp => panic!("Expected Handshake response, got {:?}", resp),
         }
     }
@@ -327,6 +331,7 @@ mod unit_tests {
             seq: 1,
             session: Some(1),
             sessions: None,
+            count: None,
         };
 
         let bytes = to_vec_named(&resp).unwrap();
@@ -361,10 +366,12 @@ mod integration_tests {
 
         match client.recv() {
             Response::Handshake {
+                seq,
                 protocol_version,
                 daemon_version,
                 ..
             } => {
+                assert_eq!(seq, 1);
                 assert_eq!(protocol_version, PROTOCOL_VERSION);
                 assert!(!daemon_version.is_empty());
             }
@@ -629,8 +636,8 @@ mod integration_tests {
         // Kill all
         client.send(&Request::KillAll);
         match client.recv() {
-            Response::Ok { session, .. } => {
-                assert_eq!(session, Some(3)); // Killed 3
+            Response::Ok { count, .. } => {
+                assert_eq!(count, Some(3)); // Killed 3
             }
             _ => panic!("Kill all failed"),
         }
@@ -678,19 +685,51 @@ mod integration_tests {
             }
         }
 
-        client.send(&Request::Input {
+        let input1_seq = client.send(&Request::Input {
             session: session1,
             data: b"printf '__S1__\\n'\n".to_vec(),
         });
-        client.send(&Request::Input {
+        let mut buffered_outputs: Vec<(u32, String)> = vec![];
+        let wait_for_input_ack = |client: &mut TestClient,
+                                  expected_seq: u32,
+                                  expected_session: u32,
+                                  buffered_outputs: &mut Vec<(u32, String)>| {
+            for _ in 0..80 {
+                let Some(resp) = client.recv_with_timeout(Duration::from_millis(100)) else {
+                    continue;
+                };
+                match resp {
+                    Response::Ok { seq, session, .. } if seq == expected_seq => {
+                        assert_eq!(session, Some(expected_session));
+                        return;
+                    }
+                    Response::Output { session, data } => {
+                        buffered_outputs.push((session, String::from_utf8_lossy(&data).to_string()));
+                    }
+                    _ => {}
+                }
+            }
+            panic!(
+                "timed out waiting for input ack seq={} session={}",
+                expected_seq, expected_session
+            );
+        };
+        wait_for_input_ack(&mut client, input1_seq, session1, &mut buffered_outputs);
+
+        let input2_seq = client.send(&Request::Input {
             session: session2,
             data: b"printf '__S2__\\n'\n".to_vec(),
         });
+        wait_for_input_ack(&mut client, input2_seq, session2, &mut buffered_outputs);
 
         client.set_read_timeout(Some(Duration::from_millis(300)));
 
-        let mut saw_session1 = false;
-        let mut saw_session2 = false;
+        let mut saw_session1 = buffered_outputs
+            .iter()
+            .any(|(session, text)| *session == session1 && text.contains("__S1__"));
+        let mut saw_session2 = buffered_outputs
+            .iter()
+            .any(|(session, text)| *session == session2 && text.contains("__S2__"));
 
         for _ in 0..40 {
             let Some(resp) = client.try_recv() else {
@@ -796,6 +835,61 @@ mod integration_tests {
         match other.recv() {
             Response::Error { code, .. } => assert_eq!(code, "ALREADY_ATTACHED"),
             resp => panic!("Expected ALREADY_ATTACHED error, got {:?}", resp),
+        }
+    }
+
+    #[test]
+    fn test_input_returns_ok() {
+        let daemon = TestDaemon::start();
+        let mut client = daemon.client();
+        client.authenticate();
+
+        client.send(&Request::Create {
+            cwd: None,
+            cols: Some(80),
+            rows: Some(24),
+            initial_commands: None,
+        });
+        let session_id = match client.recv() {
+            Response::Ok { session, .. } => session.expect("session id"),
+            resp => panic!("Create failed: {:?}", resp),
+        };
+
+        client.send(&Request::Input {
+            session: session_id,
+            data: b"echo hello\n".to_vec(),
+        });
+        match client.recv() {
+            Response::Ok { session, .. } => assert_eq!(session, Some(session_id)),
+            resp => panic!("Expected input ack, got {:?}", resp),
+        }
+    }
+
+    #[test]
+    fn test_resize_returns_ok() {
+        let daemon = TestDaemon::start();
+        let mut client = daemon.client();
+        client.authenticate();
+
+        client.send(&Request::Create {
+            cwd: None,
+            cols: Some(80),
+            rows: Some(24),
+            initial_commands: None,
+        });
+        let session_id = match client.recv() {
+            Response::Ok { session, .. } => session.expect("session id"),
+            resp => panic!("Create failed: {:?}", resp),
+        };
+
+        client.send(&Request::Resize {
+            session: session_id,
+            cols: 120,
+            rows: 40,
+        });
+        match client.recv() {
+            Response::Ok { session, .. } => assert_eq!(session, Some(session_id)),
+            resp => panic!("Expected resize ack, got {:?}", resp),
         }
     }
 }
