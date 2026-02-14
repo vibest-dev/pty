@@ -1,6 +1,5 @@
 use std::sync::OnceLock;
 
-#[allow(dead_code)]
 pub struct Config {
     pub socket_path: String,
     pub token_path: String,
@@ -8,10 +7,8 @@ pub struct Config {
     pub max_connections: u32,
     pub max_sessions: usize,
     pub scrollback_lines: usize,
-    // Simplified flow control settings
-    pub flow_threshold: usize,          // Warning threshold (default 4096)
-    pub flow_max_queue_size: usize,     // Channel capacity (default 16384)
-    pub flow_auto_disconnect: bool,     // Disconnect on full (default false)
+    pub flow_max_queue_size: usize, // Channel capacity (default 16384)
+    pub coalesce_delay_ms: u64,     // Output coalescing window (default 3ms)
 }
 
 fn default_base_dir() -> String {
@@ -26,13 +23,10 @@ impl Config {
         let socket_path = std::env::var("RUST_PTY_SOCKET_PATH")
             .unwrap_or_else(|_| format!("{}/socket", base_dir));
 
-        let token_path = std::env::var("RUST_PTY_TOKEN_PATH")
-            .unwrap_or_else(|_| format!("{}/token", base_dir));
+        let token_path =
+            std::env::var("RUST_PTY_TOKEN_PATH").unwrap_or_else(|_| format!("{}/token", base_dir));
 
-        let pid_path = format!(
-            "{}.pid",
-            socket_path.trim_end_matches(".sock")
-        );
+        let pid_path = format!("{}.pid", socket_path.trim_end_matches(".sock"));
 
         let max_connections = std::env::var("RUST_PTY_MAX_CONNECTIONS")
             .ok()
@@ -49,33 +43,15 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(10000);
 
-        // Simplified flow control configuration
-        let flow_threshold = std::env::var("RUST_PTY_FLOW_THRESHOLD")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(4096);
-
         let flow_max_queue_size = std::env::var("RUST_PTY_FLOW_MAX_QUEUE_SIZE")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(16384);
 
-        let flow_auto_disconnect = std::env::var("RUST_PTY_FLOW_AUTO_DISCONNECT")
+        let coalesce_delay_ms = std::env::var("RUST_PTY_COALESCE_DELAY_MS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(false);
-
-        // Validation
-        if flow_threshold >= flow_max_queue_size {
-            panic!(
-                "Invalid flow control config: threshold ({}) must be < max queue size ({})",
-                flow_threshold, flow_max_queue_size
-            );
-        }
-
-        if flow_threshold == 0 {
-            panic!("Invalid flow control config: threshold must be > 0");
-        }
+            .unwrap_or(3);
 
         if flow_max_queue_size == 0 {
             panic!("Invalid flow control config: max queue size must be > 0");
@@ -88,9 +64,8 @@ impl Config {
             max_connections,
             max_sessions,
             scrollback_lines,
-            flow_threshold,
             flow_max_queue_size,
-            flow_auto_disconnect,
+            coalesce_delay_ms,
         }
     }
 }

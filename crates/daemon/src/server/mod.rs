@@ -1,3 +1,3 @@
 mod handler;
 
-pub use handler::handle_connection;
+pub use handler::ClientState;

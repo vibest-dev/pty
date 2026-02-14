@@ -156,7 +156,7 @@ describe("PtyDaemonClient protocol assertions", () => {
 
     await client.waitForConnection();
     await client.handshake();
-    await expect(client.killAll()).rejects.toThrow("Protocol error: missing ok.session");
+    await expect(client.killAll()).rejects.toThrow("Protocol error: missing ok.count");
 
     client.close();
     await new Promise<void>((resolve) => server.close(() => resolve()));

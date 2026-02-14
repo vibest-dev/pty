@@ -117,6 +117,14 @@ impl PtyHandle {
     }
 }
 
+impl Drop for PtyHandle {
+    fn drop(&mut self) {
+        if self.master_fd >= 0 {
+            unsafe { libc::close(self.master_fd) };
+        }
+    }
+}
+
 unsafe fn spawn_child(
     pts_path: &str,
     cwd: &str,
@@ -182,9 +190,8 @@ unsafe fn spawn_child(
         .unwrap_or_else(|| "/bin/sh".into());
 
     let shell_cstr = CString::new(shell_path.clone()).unwrap();
-    let is_interactive = shell_path.contains("zsh")
-        || shell_path.contains("bash")
-        || shell_path.contains("fish");
+    let is_interactive =
+        shell_path.contains("zsh") || shell_path.contains("bash") || shell_path.contains("fish");
 
     if is_interactive {
         let arg = CString::new("-l").unwrap();

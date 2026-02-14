@@ -105,20 +105,6 @@ pub enum Response {
         #[serde(skip_serializing_if = "Option::is_none")]
         signal: Option<i32>,
     },
-    /// Backpressure warning event
-    BackpressureWarning {
-        session: u32,
-        queue_size: usize,
-        level: BackpressureLevel,
-    },
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BackpressureLevel {
-    Green,
-    Yellow,
-    Red,
 }
 
 impl Response {
@@ -215,14 +201,6 @@ pub struct TerminalModes {
 }
 
 impl TerminalModes {
-    pub fn defaults() -> Self {
-        Self {
-            cursor_visible: true,
-            auto_wrap: true,
-            ..Default::default()
-        }
-    }
-
     pub fn to_rehydrate_sequence(&self) -> String {
         let mut seq = String::new();
         if self.application_cursor {

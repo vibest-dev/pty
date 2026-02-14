@@ -104,10 +104,7 @@ enum Response {
         data: Vec<u8>,
     },
     #[allow(dead_code)]
-    Exit {
-        session: u32,
-        code: i32,
-    },
+    Exit { session: u32, code: i32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -690,30 +687,32 @@ mod integration_tests {
             data: b"printf '__S1__\\n'\n".to_vec(),
         });
         let mut buffered_outputs: Vec<(u32, String)> = vec![];
-        let wait_for_input_ack = |client: &mut TestClient,
-                                  expected_seq: u32,
-                                  expected_session: u32,
-                                  buffered_outputs: &mut Vec<(u32, String)>| {
-            for _ in 0..80 {
-                let Some(resp) = client.recv_with_timeout(Duration::from_millis(100)) else {
-                    continue;
-                };
-                match resp {
-                    Response::Ok { seq, session, .. } if seq == expected_seq => {
-                        assert_eq!(session, Some(expected_session));
-                        return;
+        let wait_for_input_ack =
+            |client: &mut TestClient,
+             expected_seq: u32,
+             expected_session: u32,
+             buffered_outputs: &mut Vec<(u32, String)>| {
+                for _ in 0..80 {
+                    let Some(resp) = client.recv_with_timeout(Duration::from_millis(100)) else {
+                        continue;
+                    };
+                    match resp {
+                        Response::Ok { seq, session, .. } if seq == expected_seq => {
+                            assert_eq!(session, Some(expected_session));
+                            return;
+                        }
+                        Response::Output { session, data } => {
+                            buffered_outputs
+                                .push((session, String::from_utf8_lossy(&data).to_string()));
+                        }
+                        _ => {}
                     }
-                    Response::Output { session, data } => {
-                        buffered_outputs.push((session, String::from_utf8_lossy(&data).to_string()));
-                    }
-                    _ => {}
                 }
-            }
-            panic!(
-                "timed out waiting for input ack seq={} session={}",
-                expected_seq, expected_session
-            );
-        };
+                panic!(
+                    "timed out waiting for input ack seq={} session={}",
+                    expected_seq, expected_session
+                );
+            };
         wait_for_input_ack(&mut client, input1_seq, session1, &mut buffered_outputs);
 
         let input2_seq = client.send(&Request::Input {
@@ -819,7 +818,9 @@ mod integration_tests {
             resp => panic!("Create failed: {:?}", resp),
         };
 
-        owner.send(&Request::Attach { session: session_id });
+        owner.send(&Request::Attach {
+            session: session_id,
+        });
         match owner.recv() {
             Response::Ok {
                 session: Some(attached),
@@ -830,7 +831,9 @@ mod integration_tests {
 
         let mut other = daemon.client();
         other.authenticate();
-        other.send(&Request::Attach { session: session_id });
+        other.send(&Request::Attach {
+            session: session_id,
+        });
 
         match other.recv() {
             Response::Error { code, .. } => assert_eq!(code, "ALREADY_ATTACHED"),
