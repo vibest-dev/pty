@@ -29,6 +29,8 @@ pub struct ClientState {
     max_write_queue_bytes: usize,
     /// Event that couldn't be queued due to backpressure.
     pending_response: Option<Response>,
+    /// Round-robin cursor used to pick the first receiver each drain cycle.
+    drain_start_index: usize,
     /// Whether we need to be polled for writable events.
     pub needs_write: bool,
     /// Marked for removal.
@@ -49,6 +51,7 @@ impl ClientState {
             write_queue_bytes: 0,
             max_write_queue_bytes: crate::config::config().flow_max_queue_size,
             pending_response: None,
+            drain_start_index: 0,
             needs_write: false,
             dead: false,
         })
@@ -58,7 +61,12 @@ impl ClientState {
         match encode_message(response) {
             Ok(buf) => {
                 if let Some(limit) = max_bytes {
-                    if self.write_queue_bytes.saturating_add(buf.len()) > limit {
+                    let next_size = self.write_queue_bytes.saturating_add(buf.len());
+                    // Permit one oversized frame when the queue is otherwise empty.
+                    // Without this, a single large output frame can become permanently
+                    // undeliverable because it can never fit under the byte cap.
+                    let allow_single_oversized = self.write_queue_bytes == 0 && buf.len() > limit;
+                    if next_size > limit && !allow_single_oversized {
                         return false;
                     }
                 }
@@ -170,33 +178,56 @@ impl ClientState {
 
         // Temporarily take receivers to avoid borrow conflicts while queueing.
         let receivers = std::mem::take(&mut self.session_receivers);
-        let mut saturated = false;
-        for (session_id, rx) in &receivers {
+        let receiver_count = receivers.len();
+
+        if receiver_count > 0 {
+            let mut saturated = false;
+            let mut next_start = self.drain_start_index % receiver_count;
+
             loop {
                 if self.write_queue_bytes >= max_bytes {
                     self.needs_write = true;
-                    saturated = true;
                     break;
                 }
 
-                match rx.try_recv() {
-                    Ok(event) => {
-                        let response = output_event_to_response(*session_id, event);
-                        if !self.queue_response_inner(&response, Some(max_bytes)) {
-                            self.pending_response = Some(response);
-                            self.needs_write = true;
-                            saturated = true;
-                            break;
-                        }
+                let pass_start = next_start;
+                let mut progressed = false;
+
+                for offset in 0..receiver_count {
+                    if self.write_queue_bytes >= max_bytes {
+                        self.needs_write = true;
+                        saturated = true;
+                        break;
                     }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+
+                    let idx = (pass_start + offset) % receiver_count;
+                    let (session_id, rx) = &receivers[idx];
+                    next_start = (idx + 1) % receiver_count;
+
+                    match rx.try_recv() {
+                        Ok(event) => {
+                            let response = output_event_to_response(*session_id, event);
+                            if !self.queue_response_inner(&response, Some(max_bytes)) {
+                                self.pending_response = Some(response);
+                                self.needs_write = true;
+                                saturated = true;
+                                break;
+                            }
+                            progressed = true;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+                    }
+                }
+
+                if saturated || !progressed {
+                    break;
                 }
             }
-            if saturated {
-                break;
-            }
+
+            self.drain_start_index = next_start;
         }
+
         self.session_receivers = receivers;
     }
 
@@ -385,6 +416,13 @@ mod tests {
         });
     }
 
+    fn clear_write_queue(state: &mut ClientState) {
+        state.write_queue.clear();
+        state.write_offset = 0;
+        state.write_queue_bytes = 0;
+        state.needs_write = false;
+    }
+
     #[test]
     fn one_session_queue_full_must_not_block_other_session() {
         let (tx1, _rx1) =
@@ -445,6 +483,94 @@ mod tests {
         }
         sessions.sort_unstable();
         assert_eq!(sessions, vec![1, 2]);
+    }
+
+    #[test]
+    fn oversized_output_frame_is_eventually_queued() {
+        let (s, _peer) = UnixStream::pair().unwrap();
+        let mut state = ClientState::new(s).unwrap();
+        state.max_write_queue_bytes = 128;
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<OutputEvent>(4);
+        state.session_receivers.push((1, rx));
+
+        // Pre-fill some queued bytes so the first attempt cannot fit.
+        state.write_queue.push_back(vec![0u8; 64]);
+        state.write_queue_bytes = 64;
+
+        tx.try_send(OutputEvent::Data {
+            session: 1,
+            data: vec![b'x'; 4096],
+        })
+        .expect("must queue oversized output event");
+
+        state.drain_session_output();
+        assert!(
+            state.pending_response.is_some(),
+            "oversized response should be retained as pending when queue is not empty"
+        );
+
+        clear_write_queue(&mut state);
+        state.drain_session_output();
+
+        assert!(
+            state.pending_response.is_none(),
+            "pending oversized response should be queued once queue drains"
+        );
+        assert_eq!(
+            state.write_queue.len(),
+            1,
+            "oversized response should be enqueued as a single frame"
+        );
+        assert!(
+            state.write_queue_bytes > state.max_write_queue_bytes,
+            "single oversized frame is allowed to exceed byte limit when queue is otherwise empty"
+        );
+    }
+
+    #[test]
+    fn drain_rotates_start_session_to_avoid_starvation() {
+        let (s, _peer) = UnixStream::pair().unwrap();
+        let mut state = ClientState::new(s).unwrap();
+
+        let sample_len = encode_message(&Response::Output {
+            session: 1,
+            data: vec![b'x'],
+        })
+        .expect("encode sample output")
+        .len();
+        state.max_write_queue_bytes = sample_len;
+
+        let (tx1, rx1) = std::sync::mpsc::sync_channel::<OutputEvent>(8);
+        let (tx2, rx2) = std::sync::mpsc::sync_channel::<OutputEvent>(1);
+        state.session_receivers.push((1, rx1));
+        state.session_receivers.push((2, rx2));
+
+        for _ in 0..4 {
+            tx1.try_send(OutputEvent::Data {
+                session: 1,
+                data: vec![b'a'],
+            })
+            .expect("session 1 should have backlog");
+        }
+        tx2.try_send(OutputEvent::Data {
+            session: 2,
+            data: vec![b'b'],
+        })
+        .expect("session 2 should have one event");
+
+        state.drain_session_output();
+        clear_write_queue(&mut state);
+        state.drain_session_output();
+
+        assert!(
+            tx2.try_send(OutputEvent::Data {
+                session: 2,
+                data: vec![b'c'],
+            })
+            .is_ok(),
+            "second drain should have consumed session 2 event instead of starving behind session 1 backlog"
+        );
     }
 
     #[test]

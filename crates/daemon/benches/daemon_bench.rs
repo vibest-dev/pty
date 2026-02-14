@@ -9,10 +9,10 @@
 //! - Emulator snapshot generation
 //! - Manager ReaderEvent coalescing (simulated)
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use rmp_serde::to_vec_named;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 // ============== FrameReader replica ==============
 // We reproduce FrameReader here because the daemon is a binary crate.
@@ -527,6 +527,159 @@ fn bench_sync_channel_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+// ============== Handler drain simulation ==============
+
+#[derive(Debug, Clone)]
+struct DrainSimState {
+    write_queue_bytes: usize,
+    max_write_queue_bytes: usize,
+    pending_response_bytes: Option<usize>,
+    drain_start_index: usize,
+}
+
+impl DrainSimState {
+    fn queue_response_inner(&mut self, frame_len: usize) -> bool {
+        let limit = self.max_write_queue_bytes;
+        let next_size = self.write_queue_bytes.saturating_add(frame_len);
+        let allow_single_oversized = self.write_queue_bytes == 0 && frame_len > limit;
+        if next_size > limit && !allow_single_oversized {
+            return false;
+        }
+        self.write_queue_bytes = next_size;
+        true
+    }
+
+    fn drain_session_output_sim(&mut self, receivers: &mut [VecDeque<usize>]) {
+        let max_bytes = self.max_write_queue_bytes;
+        if self.write_queue_bytes >= max_bytes {
+            return;
+        }
+
+        if let Some(frame_len) = self.pending_response_bytes.take() {
+            if !self.queue_response_inner(frame_len) {
+                self.pending_response_bytes = Some(frame_len);
+                return;
+            }
+        }
+
+        let receiver_count = receivers.len();
+        if receiver_count == 0 {
+            return;
+        }
+
+        let mut saturated = false;
+        let mut next_start = self.drain_start_index % receiver_count;
+
+        loop {
+            if self.write_queue_bytes >= max_bytes {
+                break;
+            }
+
+            let pass_start = next_start;
+            let mut progressed = false;
+
+            for offset in 0..receiver_count {
+                if self.write_queue_bytes >= max_bytes {
+                    saturated = true;
+                    break;
+                }
+
+                let idx = (pass_start + offset) % receiver_count;
+                next_start = (idx + 1) % receiver_count;
+                if let Some(frame_len) = receivers[idx].pop_front() {
+                    if !self.queue_response_inner(frame_len) {
+                        self.pending_response_bytes = Some(frame_len);
+                        saturated = true;
+                        break;
+                    }
+                    progressed = true;
+                }
+            }
+
+            if saturated || !progressed {
+                break;
+            }
+        }
+
+        self.drain_start_index = next_start;
+    }
+}
+
+fn bench_handler_drain(c: &mut Criterion) {
+    let mut group = c.benchmark_group("handler_drain");
+
+    group.bench_function("pending_oversized_frame_two_cycles", |b| {
+        b.iter_batched(
+            || {
+                (
+                    DrainSimState {
+                        write_queue_bytes: black_box(8192),
+                        max_write_queue_bytes: black_box(16384),
+                        pending_response_bytes: Some(black_box(32768)),
+                        drain_start_index: black_box(0),
+                    },
+                    Vec::<VecDeque<usize>>::new(),
+                )
+            },
+            |(mut state, mut receivers)| {
+                state.drain_session_output_sim(&mut receivers);
+                black_box(state.pending_response_bytes.is_some());
+
+                // Simulate socket flush on next event-loop cycle.
+                state.write_queue_bytes = 0;
+                state.drain_session_output_sim(&mut receivers);
+
+                assert!(state.pending_response_bytes.is_none());
+                assert!(state.write_queue_bytes > state.max_write_queue_bytes);
+                black_box(state.write_queue_bytes);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("round_robin_drain_8_sessions", |b| {
+        b.iter_batched(
+            || {
+                let mut receivers: Vec<VecDeque<usize>> = vec![VecDeque::new(); 8];
+                for _ in 0..256 {
+                    receivers[0].push_back(black_box(512));
+                }
+                for i in 1..8 {
+                    receivers[i].push_back(black_box(512));
+                }
+                (
+                    DrainSimState {
+                        write_queue_bytes: 0,
+                        max_write_queue_bytes: black_box(8192),
+                        pending_response_bytes: None,
+                        drain_start_index: black_box(0),
+                    },
+                    receivers,
+                )
+            },
+            |(mut state, mut receivers)| {
+                // Simulate repeated poll cycles with write queue flush between cycles.
+                for _ in 0..16 {
+                    state.drain_session_output_sim(&mut receivers);
+                    state.write_queue_bytes = 0;
+                }
+
+                let remaining_light_sessions = receivers
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .filter(|(_, q)| !q.is_empty())
+                    .count();
+                assert_eq!(remaining_light_sessions, 0);
+                black_box(state.drain_start_index);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_frame_reader_decode,
@@ -535,5 +688,6 @@ criterion_group!(
     bench_emulator_snapshot,
     bench_coalescing,
     bench_sync_channel_throughput,
+    bench_handler_drain,
 );
 criterion_main!(benches);
