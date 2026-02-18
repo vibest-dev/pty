@@ -1,381 +1,299 @@
 use crate::protocol::{Snapshot, TerminalModes};
-use std::collections::VecDeque;
+use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
+use std::sync::mpsc;
 
-/// Lightweight terminal emulator for state tracking
-pub struct Emulator {
-    cols: u16,
-    rows: u16,
-    screen: Vec<Vec<char>>,
-    scrollback: VecDeque<Vec<char>>,
-    max_scrollback: usize,
-    cursor_x: usize,
-    cursor_y: usize,
-    modes: TerminalModes,
-    cwd: Option<String>,
-    // Parsing state
-    escape_state: EscapeState,
-    escape_params: Vec<u16>,
-    escape_intermediate: Vec<u8>,
-    osc_buffer: String,
+/// Captures PtyWrite events from the terminal emulator.
+///
+/// When the terminal processes certain escape sequences (e.g. device attribute
+/// queries, cursor position reports), it generates response strings that must
+/// be written back to the PTY. This listener forwards them via a channel.
+#[derive(Clone)]
+struct DaemonListener {
+    pty_write_tx: mpsc::Sender<String>,
 }
 
-#[derive(Default)]
-enum EscapeState {
-    #[default]
-    Normal,
-    Escape,
-    Csi,
-    CsiParam,
-    CsiPrivate,
-    Osc,
+impl EventListener for DaemonListener {
+    fn send_event(&self, event: Event) {
+        if let Event::PtyWrite(data) = event {
+            let _ = self.pty_write_tx.send(data);
+        }
+    }
+}
+
+struct TermSize {
+    cols: usize,
+    rows: usize,
+}
+
+impl Dimensions for TermSize {
+    fn total_lines(&self) -> usize {
+        self.rows
+    }
+
+    fn screen_lines(&self) -> usize {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.cols
+    }
+}
+
+/// Terminal emulator backed by `alacritty_terminal`.
+pub struct Emulator {
+    term: Term<DaemonListener>,
+    processor: Processor,
+    pty_write_rx: mpsc::Receiver<String>,
 }
 
 impl Emulator {
     pub fn new(cols: u16, rows: u16, max_scrollback: usize) -> Self {
-        let screen = vec![vec![' '; cols as usize]; rows as usize];
+        let config = Config {
+            scrolling_history: max_scrollback,
+            ..Default::default()
+        };
+        let (tx, rx) = mpsc::channel();
+        let listener = DaemonListener { pty_write_tx: tx };
+        let size = TermSize {
+            cols: cols as usize,
+            rows: rows as usize,
+        };
+        let term = Term::new(config, &size, listener);
         Self {
-            cols,
-            rows,
-            screen,
-            scrollback: VecDeque::with_capacity(max_scrollback),
-            max_scrollback,
-            cursor_x: 0,
-            cursor_y: 0,
-            modes: TerminalModes::defaults(),
-            cwd: None,
-            escape_state: EscapeState::Normal,
-            escape_params: Vec::new(),
-            escape_intermediate: Vec::new(),
-            osc_buffer: String::new(),
+            term,
+            processor: Processor::new(),
+            pty_write_rx: rx,
         }
+    }
+
+    /// Feed raw PTY output bytes into the terminal emulator.
+    pub fn process_bytes(&mut self, bytes: &[u8]) {
+        self.processor.advance(&mut self.term, bytes);
+    }
+
+    /// Drain any write-back responses that the terminal generated.
+    ///
+    /// These must be written to the PTY fd so the child process receives
+    /// the expected responses (e.g. cursor position reports).
+    pub fn drain_pty_writes(&mut self) -> Vec<String> {
+        let mut writes = Vec::new();
+        while let Ok(data) = self.pty_write_rx.try_recv() {
+            writes.push(data);
+        }
+        writes
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
-        let new_screen = vec![vec![' '; cols as usize]; rows as usize];
-        let mut screen = new_screen;
-
-        // Copy existing content
-        for y in 0..self.rows.min(rows) as usize {
-            for x in 0..self.cols.min(cols) as usize {
-                screen[y][x] = self.screen[y][x];
-            }
-        }
-
-        self.cols = cols;
-        self.rows = rows;
-        self.screen = screen;
-        self.cursor_x = self.cursor_x.min(cols as usize - 1);
-        self.cursor_y = self.cursor_y.min(rows as usize - 1);
+        let size = TermSize {
+            cols: cols as usize,
+            rows: rows as usize,
+        };
+        self.term.resize(size);
     }
 
     pub fn clear_scrollback(&mut self) {
-        self.scrollback.clear();
+        self.term.grid_mut().clear_history();
     }
 
     pub fn snapshot(&self) -> Snapshot {
-        let mut content = String::new();
+        let content = self.build_ansi_content();
+        let mode = self.term.mode();
 
-        // Reset and clear
-        content.push_str("\x1b[0m\x1b[H\x1b[2J");
+        let modes = TerminalModes {
+            application_cursor: mode.contains(TermMode::APP_CURSOR),
+            bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
+            mouse_tracking: mode.contains(TermMode::MOUSE_REPORT_CLICK)
+                || mode.contains(TermMode::MOUSE_DRAG)
+                || mode.contains(TermMode::MOUSE_MOTION),
+            mouse_sgr: mode.contains(TermMode::SGR_MOUSE),
+            focus_reporting: mode.contains(TermMode::FOCUS_IN_OUT),
+            alternate_screen: mode.contains(TermMode::ALT_SCREEN),
+            cursor_visible: mode.contains(TermMode::SHOW_CURSOR),
+            auto_wrap: mode.contains(TermMode::LINE_WRAP),
+        };
 
-        // Scrollback (limited)
-        let skip = self.scrollback.len().saturating_sub(500);
-        for line in self.scrollback.iter().skip(skip) {
-            for &ch in line {
-                content.push(ch);
-            }
-            content.push_str("\r\n");
-        }
-
-        // Current screen
-        for (y, row) in self.screen.iter().enumerate() {
-            for &ch in row {
-                content.push(ch);
-            }
-            if y < self.screen.len() - 1 {
-                content.push_str("\r\n");
-            }
-        }
-
-        // Position cursor
-        content.push_str(&format!(
-            "\x1b[{};{}H",
-            self.cursor_y + 1,
-            self.cursor_x + 1
-        ));
+        let grid = self.term.grid();
+        let renderable = self.term.renderable_content();
+        let cursor = renderable.cursor;
 
         Snapshot {
             content,
-            rehydrate: self.modes.to_rehydrate_sequence(),
-            cols: self.cols,
-            rows: self.rows,
-            cursor_x: self.cursor_x,
-            cursor_y: self.cursor_y,
-            modes: self.modes.clone(),
-            cwd: self.cwd.clone(),
+            rehydrate: modes.to_rehydrate_sequence(),
+            cols: grid.columns() as u16,
+            rows: grid.screen_lines() as u16,
+            cursor_x: cursor.point.column.0,
+            cursor_y: cursor.point.line.0 as usize,
+            modes,
+            cwd: None, // CWD tracked via OSC 7 in protocol layer if needed
         }
     }
 
-    pub fn process_byte(&mut self, byte: u8) {
-        match &self.escape_state {
-            EscapeState::Normal => self.process_normal(byte),
-            EscapeState::Escape => self.process_escape(byte),
-            EscapeState::Csi | EscapeState::CsiParam => self.process_csi(byte),
-            EscapeState::CsiPrivate => self.process_csi_private(byte),
-            EscapeState::Osc => self.process_osc(byte),
-        }
-    }
+    /// Build an ANSI escape sequence string that reproduces the visible screen.
+    ///
+    /// Iterates all visible cells, emitting SGR sequences for color/style
+    /// changes and newlines between rows.
+    fn build_ansi_content(&self) -> String {
+        let grid = self.term.grid();
+        let cols = grid.columns();
+        let screen_lines = grid.screen_lines();
+        let history_lines = grid.history_size();
+        let history_to_render = history_lines.min(500);
+        let total_lines = history_to_render + screen_lines;
 
-    fn process_normal(&mut self, byte: u8) {
-        match byte {
-            0x1b => self.escape_state = EscapeState::Escape,
-            0x08 => self.cursor_x = self.cursor_x.saturating_sub(1), // BS
-            0x09 => self.cursor_x = ((self.cursor_x / 8) + 1) * 8,   // TAB
-            0x0a | 0x0b | 0x0c => self.line_feed(),                  // LF/VT/FF
-            0x0d => self.cursor_x = 0,                               // CR
-            0x20..=0x7e => self.print_char(byte as char),            // Printable
-            0x80..=0xff => self.print_char(byte as char),            // Extended
-            _ => {}
-        }
-    }
+        // Pre-allocate generously
+        let mut out = String::with_capacity(cols * total_lines * 4);
 
-    fn process_escape(&mut self, byte: u8) {
-        match byte {
-            b'[' => {
-                self.escape_state = EscapeState::Csi;
-                self.escape_params.clear();
-                self.escape_intermediate.clear();
-            }
-            b']' => {
-                self.escape_state = EscapeState::Osc;
-                self.osc_buffer.clear();
-            }
-            b'c' => self.reset(),
-            _ => self.escape_state = EscapeState::Normal,
-        }
-    }
+        // Reset terminal state and position cursor at top-left
+        out.push_str("\x1b[0m\x1b[H\x1b[2J");
 
-    fn process_csi(&mut self, byte: u8) {
-        match byte {
-            b'?' => {
-                self.escape_state = EscapeState::CsiPrivate;
-                self.escape_params.clear();
-            }
-            b'0'..=b'9' => {
-                let digit = (byte - b'0') as u16;
-                if let Some(last) = self.escape_params.last_mut() {
-                    *last = last.saturating_mul(10).saturating_add(digit);
-                } else {
-                    self.escape_params.push(digit);
-                }
-                self.escape_state = EscapeState::CsiParam;
-            }
-            b';' => {
-                self.escape_params.push(0);
-            }
-            b'A'..=b'z' => {
-                self.execute_csi(byte as char);
-                self.escape_state = EscapeState::Normal;
-            }
-            _ => self.escape_state = EscapeState::Normal,
-        }
-    }
+        let start_line = Line(-(history_to_render as i32));
+        let end_line = Line(screen_lines as i32 - 1);
 
-    fn process_csi_private(&mut self, byte: u8) {
-        match byte {
-            b'0'..=b'9' => {
-                let digit = (byte - b'0') as u16;
-                if let Some(last) = self.escape_params.last_mut() {
-                    *last = last.saturating_mul(10).saturating_add(digit);
-                } else {
-                    self.escape_params.push(digit);
-                }
-            }
-            b';' => self.escape_params.push(0),
-            b'h' => {
-                let modes: Vec<u16> = self.escape_params.drain(..).collect();
-                for mode in modes {
-                    self.set_mode(mode, true);
-                }
-                self.escape_state = EscapeState::Normal;
-            }
-            b'l' => {
-                let modes: Vec<u16> = self.escape_params.drain(..).collect();
-                for mode in modes {
-                    self.set_mode(mode, false);
-                }
-                self.escape_state = EscapeState::Normal;
-            }
-            _ => self.escape_state = EscapeState::Normal,
-        }
-    }
-
-    fn process_osc(&mut self, byte: u8) {
-        match byte {
-            0x07 | 0x9c => {
-                self.handle_osc();
-                self.escape_state = EscapeState::Normal;
-            }
-            0x1b => {
-                // ST might be ESC \
-                self.handle_osc();
-                self.escape_state = EscapeState::Normal;
-            }
-            _ => {
-                if self.osc_buffer.len() < 4096 {
-                    self.osc_buffer.push(byte as char);
-                }
-            }
-        }
-    }
-
-    fn handle_osc(&mut self) {
-        // OSC 7: file://host/path
-        if self.osc_buffer.starts_with("7;file://") {
-            if let Some(path_start) = self.osc_buffer[9..].find('/') {
-                let path = &self.osc_buffer[9 + path_start..];
-                self.cwd = Some(urlencoding_decode(path));
-            }
-        }
-    }
-
-    fn execute_csi(&mut self, cmd: char) {
-        let p1 = self.escape_params.first().copied().unwrap_or(1).max(1) as usize;
-        let p2 = self.escape_params.get(1).copied().unwrap_or(1).max(1) as usize;
-
-        match cmd {
-            'A' => self.cursor_y = self.cursor_y.saturating_sub(p1),
-            'B' => self.cursor_y = (self.cursor_y + p1).min(self.rows as usize - 1),
-            'C' => self.cursor_x = (self.cursor_x + p1).min(self.cols as usize - 1),
-            'D' => self.cursor_x = self.cursor_x.saturating_sub(p1),
-            'H' | 'f' => {
-                self.cursor_y = (p1 - 1).min(self.rows as usize - 1);
-                self.cursor_x = (p2 - 1).min(self.cols as usize - 1);
-            }
-            'J' => self.erase_display(self.escape_params.first().copied().unwrap_or(0)),
-            'K' => self.erase_line(self.escape_params.first().copied().unwrap_or(0)),
-            'm' => {} // SGR - ignore for simplicity
-            _ => {}
-        }
-    }
-
-    fn set_mode(&mut self, mode: u16, enable: bool) {
-        match mode {
-            1 => self.modes.application_cursor = enable,
-            25 => self.modes.cursor_visible = enable,
-            47 | 1049 => {
-                self.modes.alternate_screen = enable;
-                if enable {
-                    self.clear_screen();
-                }
-            }
-            1000 | 1002 | 1003 => self.modes.mouse_tracking = enable,
-            1004 => self.modes.focus_reporting = enable,
-            1006 => self.modes.mouse_sgr = enable,
-            2004 => self.modes.bracketed_paste = enable,
-            7 => self.modes.auto_wrap = enable,
-            _ => {}
-        }
-    }
-
-    fn print_char(&mut self, ch: char) {
-        if self.cursor_x >= self.cols as usize {
-            if self.modes.auto_wrap {
-                self.cursor_x = 0;
-                self.line_feed();
+        let mut first_line = true;
+        for line_index in start_line.0..=end_line.0 {
+            if first_line {
+                first_line = false;
             } else {
-                self.cursor_x = self.cols as usize - 1;
+                out.push_str("\r\n");
             }
-        }
+            // Reset SGR at each line start for robustness
+            out.push_str("\x1b[0m");
+            let mut prev_fg = Color::Named(NamedColor::Foreground);
+            let mut prev_bg = Color::Named(NamedColor::Background);
+            let mut prev_flags = Flags::empty();
 
-        if self.cursor_y < self.screen.len() && self.cursor_x < self.screen[0].len() {
-            self.screen[self.cursor_y][self.cursor_x] = ch;
-        }
-        self.cursor_x += 1;
-    }
-
-    fn line_feed(&mut self) {
-        self.cursor_y += 1;
-        if self.cursor_y >= self.rows as usize {
-            self.scroll_up();
-            self.cursor_y = self.rows as usize - 1;
-        }
-    }
-
-    fn scroll_up(&mut self) {
-        if !self.modes.alternate_screen {
-            let line = self.screen.remove(0);
-            if self.max_scrollback > 0 {
-                if self.scrollback.len() >= self.max_scrollback {
-                    self.scrollback.pop_front();
-                }
-                self.scrollback.push_back(line);
-            }
-        } else {
-            self.screen.remove(0);
-        }
-        self.screen.push(vec![' '; self.cols as usize]);
-    }
-
-    fn clear_screen(&mut self) {
-        for row in &mut self.screen {
-            row.fill(' ');
-        }
-        self.cursor_x = 0;
-        self.cursor_y = 0;
-    }
-
-    fn erase_display(&mut self, mode: u16) {
-        match mode {
-            0 => {
-                // Cursor to end
-                self.screen[self.cursor_y][self.cursor_x..].fill(' ');
-                for row in &mut self.screen[self.cursor_y + 1..] {
-                    row.fill(' ');
+            // Find last non-empty column to avoid trailing spaces
+            let line = Line(line_index);
+            let mut last_col = 0;
+            for col in (0..cols).rev() {
+                let cell = &grid[line][Column(col)];
+                if cell.c != ' '
+                    || cell.fg != Color::Named(NamedColor::Foreground)
+                    || cell.bg != Color::Named(NamedColor::Background)
+                    || !cell.flags.is_empty()
+                {
+                    last_col = col + 1;
+                    break;
                 }
             }
-            1 => {
-                // Start to cursor
-                for row in &mut self.screen[..self.cursor_y] {
-                    row.fill(' ');
+
+            for col in 0..last_col {
+                let cell = &grid[line][Column(col)];
+
+                // Skip wide char spacers
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
                 }
-                self.screen[self.cursor_y][..=self.cursor_x].fill(' ');
+
+                // Emit SGR if attributes changed
+                let flags_changed = cell.flags != prev_flags;
+                let fg_changed = cell.fg != prev_fg;
+                let bg_changed = cell.bg != prev_bg;
+
+                if flags_changed || fg_changed || bg_changed {
+                    out.push_str("\x1b[0"); // Reset, then set active attributes
+
+                    // Flags
+                    if cell.flags.contains(Flags::BOLD) {
+                        out.push_str(";1");
+                    }
+                    if cell.flags.contains(Flags::DIM) {
+                        out.push_str(";2");
+                    }
+                    if cell.flags.contains(Flags::ITALIC) {
+                        out.push_str(";3");
+                    }
+                    if cell.flags.contains(Flags::UNDERLINE) {
+                        out.push_str(";4");
+                    }
+                    if cell.flags.contains(Flags::INVERSE) {
+                        out.push_str(";7");
+                    }
+                    if cell.flags.contains(Flags::HIDDEN) {
+                        out.push_str(";8");
+                    }
+                    if cell.flags.contains(Flags::STRIKEOUT) {
+                        out.push_str(";9");
+                    }
+
+                    // Foreground
+                    push_color_sgr(&mut out, cell.fg, true);
+                    // Background
+                    push_color_sgr(&mut out, cell.bg, false);
+
+                    out.push('m');
+
+                    prev_fg = cell.fg;
+                    prev_bg = cell.bg;
+                    prev_flags = cell.flags;
+                }
+
+                out.push(cell.c);
             }
-            2 | 3 => self.clear_screen(),
-            _ => {}
         }
-    }
 
-    fn erase_line(&mut self, mode: u16) {
-        match mode {
-            0 => self.screen[self.cursor_y][self.cursor_x..].fill(' '),
-            1 => self.screen[self.cursor_y][..=self.cursor_x].fill(' '),
-            2 => self.screen[self.cursor_y].fill(' '),
-            _ => {}
-        }
-    }
+        // Reset SGR at the end
+        out.push_str("\x1b[0m");
 
-    fn reset(&mut self) {
-        self.clear_screen();
-        self.modes = TerminalModes::defaults();
-        self.escape_state = EscapeState::Normal;
+        out
     }
 }
 
-fn urlencoding_decode(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars();
+/// Append SGR color parameters to the output string.
+fn push_color_sgr(out: &mut String, color: Color, is_fg: bool) {
+    let base = if is_fg { 30 } else { 40 };
 
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            let hex: String = chars.by_ref().take(2).collect();
-            if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                result.push(byte as char);
+    match color {
+        Color::Named(named) => {
+            let code = match named {
+                NamedColor::Black => Some(base),
+                NamedColor::Red => Some(base + 1),
+                NamedColor::Green => Some(base + 2),
+                NamedColor::Yellow => Some(base + 3),
+                NamedColor::Blue => Some(base + 4),
+                NamedColor::Magenta => Some(base + 5),
+                NamedColor::Cyan => Some(base + 6),
+                NamedColor::White => Some(base + 7),
+                NamedColor::BrightBlack => Some(base + 60),
+                NamedColor::BrightRed => Some(base + 61),
+                NamedColor::BrightGreen => Some(base + 62),
+                NamedColor::BrightYellow => Some(base + 63),
+                NamedColor::BrightBlue => Some(base + 64),
+                NamedColor::BrightMagenta => Some(base + 65),
+                NamedColor::BrightCyan => Some(base + 66),
+                NamedColor::BrightWhite => Some(base + 67),
+                // Foreground/Background/Cursor/Dim* are "default" — no SGR needed
+                _ => None,
+            };
+            if let Some(c) = code {
+                out.push(';');
+                out.push_str(&c.to_string());
             }
-        } else {
-            result.push(c);
+        }
+        Color::Indexed(idx) => {
+            // 256-color: ESC[38;5;{idx}m or ESC[48;5;{idx}m
+            let prefix = if is_fg { 38 } else { 48 };
+            out.push(';');
+            out.push_str(&prefix.to_string());
+            out.push_str(";5;");
+            out.push_str(&idx.to_string());
+        }
+        Color::Spec(rgb) => {
+            // True color: ESC[38;2;r;g;bm or ESC[48;2;r;g;bm
+            let prefix = if is_fg { 38 } else { 48 };
+            out.push(';');
+            out.push_str(&prefix.to_string());
+            out.push_str(";2;");
+            out.push_str(&rgb.r.to_string());
+            out.push(';');
+            out.push_str(&rgb.g.to_string());
+            out.push(';');
+            out.push_str(&rgb.b.to_string());
         }
     }
-
-    result
 }

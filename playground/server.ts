@@ -3,9 +3,23 @@ import {
   type PtyDaemonClient,
   type SessionInfo,
 } from "@vibest/pty-daemon";
-import { existsSync, mkdirSync, unlinkSync } from "fs";
-import { readFile, writeFile } from "fs/promises";
-import { join, resolve } from "path";
+import { decode, encode } from "@msgpack/msgpack";
+import { existsSync } from "fs";
+import { resolve } from "path";
+
+function parsePositiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) {
+    return fallback;
+  }
+
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) {
+    return fallback;
+  }
+
+  return Math.floor(value);
+}
 
 const DEFAULT_BASE_DIR = `${process.env.HOME || "/tmp"}/.vibest/pty`;
 const SOCKET_PATH = process.env.RUST_PTY_SOCKET_PATH || `${DEFAULT_BASE_DIR}/socket`;
@@ -16,39 +30,72 @@ const DAEMON_BINARY_PATH =
   (existsSync(LOCAL_DAEMON_BINARY_PATH) ? LOCAL_DAEMON_BINARY_PATH : undefined);
 const PROTOCOL_VERSION = 1;
 const PORT = Number(process.env.PORT || 3000);
-const HISTORY_DIR = process.env.RUST_PTY_HISTORY_DIR || "/tmp/.vibest/pty-history";
 const MAX_HISTORY_BYTES = 5 * 1024 * 1024;
 const MAX_ATTACH_HISTORY_BYTES = 512 * 1024;
-const HISTORY_FLUSH_INTERVAL_MS = 200;
+const MAX_TOTAL_HISTORY_BYTES = parsePositiveIntEnv("RUST_PTY_MAX_TOTAL_HISTORY_BYTES", 128 * 1024 * 1024);
+const HEARTBEAT_INTERVAL_MS = 15_000;
+const HEARTBEAT_TIMEOUT_MS = 45_000;
 const CLEAR_SCROLLBACK_SEQUENCE = Buffer.from([0x1b, 0x5b, 0x33, 0x4a]);
-
-mkdirSync(HISTORY_DIR, { recursive: true, mode: 0o700 });
 
 type WebSocketMessage =
   | { type: "create" }
   | { type: "list" }
-  | { type: "attach"; session: number }
+  | { type: "attach"; session: number; lastSeq?: number }
+  | { type: "ack"; session: number; seq: number }
+  | { type: "pong"; ts?: number }
   | { type: "kill"; session: number }
-  | { type: "input"; session: number; data: string }
+  | { type: "input"; session: number; data: Uint8Array }
   | { type: "resize"; session: number; cols: number; rows: number };
 
+interface HistoryChunk {
+  startSeq: number;
+  endSeq: number;
+  data: Buffer;
+}
+
 interface HistoryState {
-  buffer: Buffer;
-  flushTimer: ReturnType<typeof setTimeout> | null;
-  flushing: boolean;
-  pendingFlush: boolean;
+  chunks: HistoryChunk[];
+  totalBytes: number;
+  nextSeq: number;
   createdAt: number;
   lastUpdatedAt: number;
 }
 
-const historyStates = new Map<number, HistoryState>();
-
-function historyFilePath(sessionId: number): string {
-  return join(HISTORY_DIR, `session-${sessionId}.bin`);
+interface AttachReplay {
+  history: Buffer | null;
+  seq: number;
+  reset: boolean;
 }
 
-function historyMetaPath(sessionId: number): string {
-  return join(HISTORY_DIR, `session-${sessionId}.json`);
+interface ClientContext {
+  attachedSessions: Set<number>;
+  deliveredSeqBySession: Map<number, number>;
+  ackedSeqBySession: Map<number, number>;
+  lastSeenAt: number;
+}
+
+const historyStates = new Map<number, HistoryState>();
+const clients = new Map<any, ClientContext>();
+let totalHistoryBytes = 0;
+let sharedPty: ReturnType<typeof createPty> | null = null;
+
+function sendFrame(ws: any, frame: object): void {
+  ws.send(encode(frame));
+}
+
+function sendError(ws: any, message: string): void {
+  sendFrame(ws, { type: "error", message });
+}
+
+function decodeWebSocketMessage(message: string | Buffer | Uint8Array | ArrayBuffer): WebSocketMessage {
+  if (typeof message === "string") {
+    throw new Error("text frame is not supported; use binary MessagePack frames");
+  }
+  if (message instanceof ArrayBuffer) {
+    return decode(new Uint8Array(message)) as WebSocketMessage;
+  }
+
+  return decode(new Uint8Array(message)) as WebSocketMessage;
 }
 
 function dropLeadingUtf8Continuation(buffer: Buffer): Buffer {
@@ -93,10 +140,9 @@ function getHistoryState(sessionId: number): HistoryState {
 
   const now = Date.now();
   const state: HistoryState = {
-    buffer: Buffer.alloc(0),
-    flushTimer: null,
-    flushing: false,
-    pendingFlush: false,
+    chunks: [],
+    totalBytes: 0,
+    nextSeq: 0,
     createdAt: now,
     lastUpdatedAt: now,
   };
@@ -105,156 +151,242 @@ function getHistoryState(sessionId: number): HistoryState {
   return state;
 }
 
-function scheduleHistoryFlush(sessionId: number, state: HistoryState): void {
-  if (state.flushTimer) {
-    return;
+function isSessionAttached(sessionId: number): boolean {
+  for (const ctx of clients.values()) {
+    if (ctx.attachedSessions.has(sessionId)) {
+      return true;
+    }
   }
 
-  state.flushTimer = setTimeout(() => {
-    state.flushTimer = null;
-    void flushHistory(sessionId);
-  }, HISTORY_FLUSH_INTERVAL_MS);
+  return false;
 }
 
-async function flushHistory(sessionId: number): Promise<void> {
-  const state = historyStates.get(sessionId);
-  if (!state) {
+function discardHistoryData(state: HistoryState): void {
+  if (state.totalBytes <= 0) {
     return;
   }
 
-  if (state.flushing) {
-    state.pendingFlush = true;
-    return;
-  }
+  totalHistoryBytes = Math.max(0, totalHistoryBytes - state.totalBytes);
+  state.chunks = [];
+  state.totalBytes = 0;
+  state.lastUpdatedAt = Date.now();
+}
 
-  state.flushing = true;
-  const buffer = state.buffer;
+function evictHistoryIfNeeded(preferredSessionId?: number): void {
+  while (totalHistoryBytes > MAX_TOTAL_HISTORY_BYTES) {
+    let bestId: number | undefined;
+    let bestState: HistoryState | undefined;
 
-  try {
-    await writeFile(historyFilePath(sessionId), buffer);
-    await writeFile(
-      historyMetaPath(sessionId),
-      JSON.stringify({
-        sessionId,
-        createdAt: new Date(state.createdAt).toISOString(),
-        updatedAt: new Date(state.lastUpdatedAt).toISOString(),
-        size: buffer.length,
-      }),
-    );
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error(`[history] Failed to flush session ${sessionId}: ${message}`);
-  } finally {
-    state.flushing = false;
-  }
+    for (const [id, state] of historyStates) {
+      if (state.totalBytes === 0 || id === preferredSessionId || isSessionAttached(id)) {
+        continue;
+      }
 
-  if (state.pendingFlush) {
-    state.pendingFlush = false;
-    scheduleHistoryFlush(sessionId, state);
+      if (!bestState || state.lastUpdatedAt < bestState.lastUpdatedAt) {
+        bestId = id;
+        bestState = state;
+      }
+    }
+
+    if (!bestState) {
+      for (const [id, state] of historyStates) {
+        if (state.totalBytes === 0 || id === preferredSessionId) {
+          continue;
+        }
+
+        if (!bestState || state.lastUpdatedAt < bestState.lastUpdatedAt) {
+          bestId = id;
+          bestState = state;
+        }
+      }
+    }
+
+    if (!bestState || bestId === undefined) {
+      break;
+    }
+
+    discardHistoryData(bestState);
+    console.warn(`[history] Evicted in-memory history for session ${bestId} due to global memory pressure`);
   }
 }
 
-function appendHistory(sessionId: number, data: Uint8Array): void {
-  if (data.length === 0) {
-    return;
+function trimHistoryState(state: HistoryState): void {
+  let overflow = state.totalBytes - MAX_HISTORY_BYTES;
+  while (overflow > 0 && state.chunks.length > 0) {
+    const first = state.chunks[0];
+    const len = first.data.length;
+
+    if (len <= overflow) {
+      state.chunks.shift();
+      state.totalBytes -= len;
+      overflow -= len;
+      continue;
+    }
+
+    const rawSliced = first.data.slice(overflow);
+    const sliced = dropLeadingUtf8Continuation(rawSliced);
+    const dropped = first.data.length - sliced.length;
+
+    first.data = sliced;
+    first.startSeq += dropped;
+    state.totalBytes -= dropped;
+    overflow = 0;
+
+    if (first.data.length === 0) {
+      state.chunks.shift();
+    }
+  }
+}
+
+function historyBounds(state: HistoryState): { headSeq: number; tailSeq: number } {
+  if (state.chunks.length === 0) {
+    return { headSeq: state.nextSeq, tailSeq: state.nextSeq };
   }
 
+  return { headSeq: state.chunks[0].startSeq, tailSeq: state.nextSeq };
+}
+
+function appendHistory(sessionId: number, data: Uint8Array): number {
   const state = getHistoryState(sessionId);
+  const beforeBytes = state.totalBytes;
+
+  if (data.length === 0) {
+    return state.nextSeq;
+  }
+
   let chunk = Buffer.from(data);
 
   const clearIndex = findLastSequence(chunk, CLEAR_SCROLLBACK_SEQUENCE);
   if (clearIndex >= 0) {
     chunk = chunk.slice(clearIndex + CLEAR_SCROLLBACK_SEQUENCE.length);
-    state.buffer = Buffer.alloc(0);
+    state.chunks = [];
+    state.totalBytes = 0;
   }
 
   if (chunk.length === 0) {
-    return;
+    return state.nextSeq;
   }
 
-  const combined = Buffer.concat([state.buffer, chunk], state.buffer.length + chunk.length);
-  if (combined.length > MAX_HISTORY_BYTES) {
-    const sliced = combined.slice(combined.length - MAX_HISTORY_BYTES);
-    state.buffer = dropLeadingUtf8Continuation(sliced);
-  } else {
-    state.buffer = combined;
-  }
-
+  const startSeq = state.nextSeq;
+  const endSeq = startSeq + chunk.length;
+  state.chunks.push({ startSeq, endSeq, data: chunk });
+  state.totalBytes += chunk.length;
+  state.nextSeq = endSeq;
   state.lastUpdatedAt = Date.now();
-  scheduleHistoryFlush(sessionId, state);
+
+  trimHistoryState(state);
+  totalHistoryBytes += state.totalBytes - beforeBytes;
+  evictHistoryIfNeeded(sessionId);
+
+  return state.nextSeq;
 }
 
-async function readHistoryTail(sessionId: number): Promise<Buffer | null> {
-  try {
-    const data = await readFile(historyFilePath(sessionId));
-    if (!data.length) {
-      return null;
+function collectHistorySince(state: HistoryState, fromSeq: number): Buffer | null {
+  const parts: Buffer[] = [];
+  let size = 0;
+
+  for (const chunk of state.chunks) {
+    if (chunk.endSeq <= fromSeq) {
+      continue;
     }
 
-    let tail = data;
-    if (data.length > MAX_ATTACH_HISTORY_BYTES) {
-      tail = data.slice(data.length - MAX_ATTACH_HISTORY_BYTES);
+    let part = chunk.data;
+    if (chunk.startSeq < fromSeq) {
+      const offset = fromSeq - chunk.startSeq;
+      part = chunk.data.slice(offset);
     }
 
-    tail = dropLeadingUtf8Continuation(tail);
-    return tail.length > 0 ? tail : null;
-  } catch {
+    if (part.length === 0) {
+      continue;
+    }
+
+    parts.push(part);
+    size += part.length;
+  }
+
+  if (size === 0) {
     return null;
   }
+
+  let out = parts.length === 1 ? parts[0] : Buffer.concat(parts, size);
+  if (out.length > MAX_ATTACH_HISTORY_BYTES) {
+    out = dropLeadingUtf8Continuation(out.slice(out.length - MAX_ATTACH_HISTORY_BYTES));
+  }
+
+  return out.length > 0 ? out : null;
+}
+
+function readHistoryTail(sessionId: number): Buffer | null {
+  const state = historyStates.get(sessionId);
+  if (!state || state.totalBytes === 0) {
+    return null;
+  }
+
+  const { tailSeq } = historyBounds(state);
+  const fromSeq = Math.max(0, tailSeq - MAX_ATTACH_HISTORY_BYTES);
+  return collectHistorySince(state, fromSeq);
+}
+
+function readAttachReplay(sessionId: number, lastSeq?: number): AttachReplay {
+  const state = historyStates.get(sessionId);
+  if (!state) {
+    return { history: null, seq: 0, reset: lastSeq !== undefined && lastSeq > 0 };
+  }
+
+  const { headSeq, tailSeq } = historyBounds(state);
+
+  if (lastSeq === undefined) {
+    return { history: readHistoryTail(sessionId), seq: tailSeq, reset: true };
+  }
+
+  if (lastSeq < headSeq || lastSeq > tailSeq) {
+    return { history: readHistoryTail(sessionId), seq: tailSeq, reset: true };
+  }
+
+  if (lastSeq === tailSeq) {
+    return { history: null, seq: tailSeq, reset: false };
+  }
+
+  return {
+    history: collectHistorySince(state, lastSeq),
+    seq: tailSeq,
+    reset: false,
+  };
 }
 
 function clearHistory(sessionId: number): void {
   const state = historyStates.get(sessionId);
-  if (state?.flushTimer) {
-    clearTimeout(state.flushTimer);
+  if (!state) {
+    return;
   }
+
+  discardHistoryData(state);
   historyStates.delete(sessionId);
-
-  const binPath = historyFilePath(sessionId);
-  if (existsSync(binPath)) {
-    try {
-      unlinkSync(binPath);
-    } catch (error) {
-      console.warn(`[history] Failed to remove ${binPath}:`, error);
-    }
-  }
-
-  const metaPath = historyMetaPath(sessionId);
-  if (existsSync(metaPath)) {
-    try {
-      unlinkSync(metaPath);
-    } catch (error) {
-      console.warn(`[history] Failed to remove ${metaPath}:`, error);
-    }
-  }
 }
-
-interface ClientContext {
-  attachedSessions: Set<number>;
-}
-
-const clients = new Map<any, ClientContext>();
-let sharedPty: ReturnType<typeof createPty> | null = null;
 
 function broadcastOutput(session: number, data: Uint8Array): void {
-  appendHistory(session, data);
-  const base64 = Buffer.from(data).toString("base64");
+  const seq = appendHistory(session, data);
 
   for (const [ws, ctx] of clients) {
-    if (ctx.attachedSessions.has(session)) {
-      ws.send(JSON.stringify({ type: "output", session, data: base64 }));
+    if (!ctx.attachedSessions.has(session)) {
+      continue;
     }
+
+    sendFrame(ws, { type: "output", session, data, seq });
+    ctx.deliveredSeqBySession.set(session, seq);
   }
 }
 
 function broadcastExit(session: number, code: number): void {
-  void flushHistory(session);
-
   for (const [ws, ctx] of clients) {
-    if (ctx.attachedSessions.has(session)) {
-      ctx.attachedSessions.delete(session);
-      ws.send(JSON.stringify({ type: "exit", session, code }));
+    if (!ctx.attachedSessions.has(session)) {
+      continue;
     }
+
+    ctx.attachedSessions.delete(session);
+    ctx.deliveredSeqBySession.delete(session);
+    ctx.ackedSeqBySession.delete(session);
+    sendFrame(ws, { type: "exit", session, code });
   }
 }
 
@@ -312,36 +444,69 @@ async function handleWebSocketMessage(ws: any, ctx: ClientContext, msg: WebSocke
       case "create": {
         const { session } = await daemon.create();
         clearHistory(session);
-        ws.send(JSON.stringify({ type: "created", session }));
+        sendFrame(ws, { type: "created", session });
         break;
       }
 
       case "list": {
         const sessions: SessionInfo[] = await daemon.list();
-        ws.send(JSON.stringify({ type: "sessions", sessions }));
+        sendFrame(ws, { type: "sessions", sessions });
         break;
       }
 
       case "attach": {
         const { snapshot } = await daemon.attach({ id: msg.session });
-        const history = await readHistoryTail(msg.session);
-        const historyBase64 = history ? history.toString("base64") : undefined;
+
+        const explicitLastSeq =
+          typeof msg.lastSeq === "number" && Number.isFinite(msg.lastSeq)
+            ? Math.max(0, Math.floor(msg.lastSeq))
+            : undefined;
+        const effectiveLastSeq =
+          explicitLastSeq ?? ctx.ackedSeqBySession.get(msg.session) ?? ctx.deliveredSeqBySession.get(msg.session);
+        const replay = readAttachReplay(msg.session, effectiveLastSeq);
+
         ctx.attachedSessions.add(msg.session);
-        ws.send(JSON.stringify({ type: "attached", session: msg.session, snapshot, history: historyBase64 }));
+        ctx.deliveredSeqBySession.set(msg.session, replay.seq);
+
+        sendFrame(ws, {
+          type: "attached",
+          session: msg.session,
+          snapshot: replay.reset ? snapshot : undefined,
+          history: replay.history ?? undefined,
+          seq: replay.seq,
+          reset: replay.reset,
+        });
+        break;
+      }
+
+      case "ack": {
+        const seq = Number.isFinite(msg.seq) ? Math.max(0, Math.floor(msg.seq)) : undefined;
+        if (seq !== undefined) {
+          const prev = ctx.ackedSeqBySession.get(msg.session);
+          if (prev === undefined || seq > prev) {
+            ctx.ackedSeqBySession.set(msg.session, seq);
+          }
+        }
+        break;
+      }
+
+      case "pong": {
+        ctx.lastSeenAt = Date.now();
         break;
       }
 
       case "kill": {
         await daemon.kill(msg.session);
         ctx.attachedSessions.delete(msg.session);
+        ctx.deliveredSeqBySession.delete(msg.session);
+        ctx.ackedSeqBySession.delete(msg.session);
         clearHistory(msg.session);
-        ws.send(JSON.stringify({ type: "killed", session: msg.session }));
+        sendFrame(ws, { type: "killed", session: msg.session });
         break;
       }
 
       case "input": {
-        const data = Uint8Array.from(Buffer.from(msg.data, "base64"));
-        daemon.write({ id: msg.session }, data);
+        daemon.write({ id: msg.session }, msg.data);
         break;
       }
 
@@ -352,7 +517,7 @@ async function handleWebSocketMessage(ws: any, ctx: ClientContext, msg: WebSocke
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    ws.send(JSON.stringify({ type: "error", message }));
+    sendError(ws, message);
   }
 }
 
@@ -390,15 +555,18 @@ Bun.serve({
         const daemon = await getSharedDaemon();
         const ctx: ClientContext = {
           attachedSessions: new Set(),
+          deliveredSeqBySession: new Map(),
+          ackedSeqBySession: new Map(),
+          lastSeenAt: Date.now(),
         };
         clients.set(ws, ctx);
 
         const sessions = await daemon.list();
-        ws.send(JSON.stringify({ type: "sessions", sessions }));
+        sendFrame(ws, { type: "sessions", sessions });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         console.error("[ws] Failed to connect to daemon:", error);
-        ws.send(JSON.stringify({ type: "error", message: `Failed to connect to PTY daemon: ${message}` }));
+        sendError(ws, `Failed to connect to PTY daemon: ${message}`);
         ws.close();
       }
     },
@@ -409,8 +577,10 @@ Bun.serve({
         return;
       }
 
+      ctx.lastSeenAt = Date.now();
+
       try {
-        const msg = JSON.parse(message.toString()) as WebSocketMessage;
+        const msg = decodeWebSocketMessage(message as string | Buffer | Uint8Array | ArrayBuffer);
         void handleWebSocketMessage(ws, ctx, msg);
       } catch (error) {
         console.error("Invalid message:", error);
@@ -418,9 +588,27 @@ Bun.serve({
     },
 
     close(ws) {
+      const ctx = clients.get(ws);
+      if (ctx && ctx.attachedSessions.size > 0 && sharedPty) {
+        for (const session of ctx.attachedSessions) {
+          sharedPty.client.detach(session).catch(() => {});
+        }
+      }
       clients.delete(ws);
     },
   },
 });
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [ws, ctx] of clients) {
+    if (now - ctx.lastSeenAt > HEARTBEAT_TIMEOUT_MS) {
+      ws.close();
+      continue;
+    }
+
+    sendFrame(ws, { type: "ping", ts: now });
+  }
+}, HEARTBEAT_INTERVAL_MS);
 
 console.log(`Server running at http://localhost:${PORT}`);

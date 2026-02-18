@@ -9,11 +9,19 @@ name = "vibest-pty-daemon"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1.40", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "signal", "fs", "time"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
+polling = "3"
+signal-hook = "0.3"
 rustix = { version = "0.38", features = ["pty", "process", "termios", "event", "fs"] }
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_bytes = "0.11"
 rmp-serde = "1.3"
 rand = "0.8"
+alacritty_terminal = "0.25"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "daemon_bench"
+harness = false

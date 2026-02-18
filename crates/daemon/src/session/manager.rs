@@ -1,51 +1,135 @@
 use super::{Emulator, PtyHandle};
 use crate::config::config;
 use crate::error::{Error, Result};
-use crate::protocol::{BackpressureLevel, CreateOptions, SessionInfo, Snapshot};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use crate::protocol::{CreateOptions, SessionInfo, Snapshot};
+use std::collections::{HashMap, VecDeque};
+use std::io;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::mpsc::TrySendError;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const INPUT_WRITE_BACKOFF_MIN_MS: u64 = 2;
+const INPUT_WRITE_BACKOFF_MAX_MS: u64 = 50;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SessionLifecycleState {
+    Alive = 0,
+    Terminating = 1,
+    Dead = 2,
+}
+
+impl SessionLifecycleState {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Alive,
+            1 => Self::Terminating,
+            _ => Self::Dead,
+        }
+    }
+}
 
 pub static MANAGER: OnceLock<Manager> = OnceLock::new();
 
 pub fn manager() -> &'static Manager {
-    MANAGER.get_or_init(Manager::new)
+    MANAGER
+        .get()
+        .expect("Manager not initialized; call Manager::new_with_wakeup() first")
 }
 
-/// Message sent to subscribers
-#[derive(Debug, Clone)]
-pub enum OutputEvent {
+/// Message sent from reader threads to the main event loop.
+#[derive(Debug)]
+pub enum ReaderEvent {
+    /// Raw PTY output data for a session.
     Data { session: u32, data: Vec<u8> },
-    Exit { session: u32, code: i32, signal: Option<i32> },
-    BackpressureWarning {
+    /// The reader thread has exited (EOF or error). The main loop
+    /// should wait for the child and broadcast an Exit event.
+    Eof { session: u32 },
+}
+
+/// Message sent to client subscribers.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum OutputEvent {
+    Data {
         session: u32,
-        queue_size: usize,
-        level: BackpressureLevel,
+        data: Vec<u8>,
+    },
+    Exit {
+        session: u32,
+        code: i32,
+        signal: Option<i32>,
     },
 }
 
-// Simplified Session structure
 pub struct Session {
     pub id: u32,
     pub pty: PtyHandle,
-    pub emulator: tokio::sync::Mutex<Emulator>,
+    pub emulator: Mutex<Emulator>,
     pub running: AtomicBool,
+    pub lifecycle: AtomicU8,
+    pub reader_eof: AtomicBool,
+    pub exit_status: Mutex<Option<(i32, Option<i32>)>>,
+    pub input_queue: Mutex<VecDeque<Vec<u8>>>,
+    pub input_queue_bytes: AtomicUsize,
+    pub input_backoff_ms: AtomicU64,
+    pub input_backoff_until_ms: AtomicU64,
     pub created_at: SystemTime,
     pub last_attached: AtomicU64, // nanos since epoch
 }
 
 impl Session {
-    pub fn is_alive(&self) -> bool {
-        self.running.load(Ordering::Relaxed)
+    pub fn lifecycle_state(&self) -> SessionLifecycleState {
+        SessionLifecycleState::from_u8(self.lifecycle.load(Ordering::Relaxed))
     }
 
-    pub async fn snapshot(&self) -> Snapshot {
-        self.emulator.lock().await.snapshot()
+    pub fn mark_terminating(&self) {
+        self.lifecycle
+            .store(SessionLifecycleState::Terminating as u8, Ordering::SeqCst);
+    }
+
+    pub fn mark_dead(&self) {
+        self.lifecycle
+            .store(SessionLifecycleState::Dead as u8, Ordering::SeqCst);
+    }
+
+    pub fn try_mark_terminating(&self) -> Result<()> {
+        match self.lifecycle.compare_exchange(
+            SessionLifecycleState::Alive as u8,
+            SessionLifecycleState::Terminating as u8,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => Ok(()),
+            Err(current) => {
+                let state = SessionLifecycleState::from_u8(current);
+                match state {
+                    SessionLifecycleState::Alive => Ok(()),
+                    SessionLifecycleState::Terminating => Err(Error::Session(format!(
+                        "session {} is terminating",
+                        self.id
+                    ))),
+                    SessionLifecycleState::Dead => {
+                        Err(Error::NotFound(format!("session {}", self.id)))
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn is_alive(&self) -> bool {
+        self.lifecycle_state() == SessionLifecycleState::Alive
+            && self.running.load(Ordering::Relaxed)
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        self.emulator.lock().unwrap().snapshot()
     }
 
     pub fn to_info(&self) -> SessionInfo {
-        let created_secs = self.created_at
+        let created_secs = self
+            .created_at
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
@@ -63,71 +147,104 @@ impl Session {
     }
 }
 
-// Simplified Manager
+/// Central session manager. All methods are synchronous.
 pub struct Manager {
-    sessions: Arc<tokio::sync::RwLock<HashMap<u32, Arc<Session>>>>,
+    sessions: RwLock<HashMap<u32, Arc<Session>>>,
+    pid_to_session: RwLock<HashMap<i32, u32>>,
     next_id: AtomicU32,
-    // One subscriber per session (single-client attachment model).
-    session_subscribers: Arc<tokio::sync::RwLock<HashMap<u32, tokio::sync::mpsc::Sender<OutputEvent>>>>,
+    /// One subscriber per session (single-client attachment model).
+    /// The value is a bounded sender that the main loop reads from
+    /// via the paired receiver stored in the client state.
+    session_subscribers: RwLock<HashMap<u32, std::sync::mpsc::SyncSender<OutputEvent>>>,
+    /// Number of output events dropped per session due to subscriber backpressure.
+    dropped_event_counts: Mutex<HashMap<u32, u64>>,
+    /// Channel from reader threads → main event loop.
+    /// The main loop polls the receiver end to drain PTY output.
+    reader_tx: std::sync::mpsc::SyncSender<ReaderEvent>,
+    reader_rx: Mutex<std::sync::mpsc::Receiver<ReaderEvent>>,
+    /// Pipe used by reader threads to wake up the main polling loop.
+    /// The reader writes a byte here after sending on the channel.
+    wakeup_write_fd: i32,
 }
 
 impl Manager {
-    pub fn new() -> Self {
-        Self {
-            sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            next_id: AtomicU32::new(1),
-            session_subscribers: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+    /// Create the manager and return (manager, wakeup_read_fd).
+    pub fn new_with_wakeup() -> (Self, i32) {
+        let (reader_tx, reader_rx) = std::sync::mpsc::sync_channel(256);
+
+        let mut fds = [0i32; 2];
+        unsafe { libc::pipe(fds.as_mut_ptr()) };
+        // Make both ends non-blocking
+        unsafe {
+            let flags = libc::fcntl(fds[0], libc::F_GETFL);
+            libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK);
+            let flags = libc::fcntl(fds[1], libc::F_GETFL);
+            libc::fcntl(fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
+
+        let mgr = Self {
+            sessions: RwLock::new(HashMap::new()),
+            pid_to_session: RwLock::new(HashMap::new()),
+            next_id: AtomicU32::new(1),
+            session_subscribers: RwLock::new(HashMap::new()),
+            dropped_event_counts: Mutex::new(HashMap::new()),
+            reader_tx,
+            reader_rx: Mutex::new(reader_rx),
+            wakeup_write_fd: fds[1],
+        };
+
+        (mgr, fds[0])
     }
 
-    /// Add a subscriber for a specific session's output/exit events
-    pub async fn add_session_subscriber(
+    /// Add a subscriber for a specific session's output/exit events.
+    pub fn add_session_subscriber(
         &self,
         session_id: u32,
-        tx: tokio::sync::mpsc::Sender<OutputEvent>,
+        tx: std::sync::mpsc::SyncSender<OutputEvent>,
     ) -> Result<()> {
-        if !self.sessions.read().await.contains_key(&session_id) {
+        if !self.sessions.read().unwrap().contains_key(&session_id) {
             return Err(Error::NotFound(format!("session {}", session_id)));
         }
 
-        let mut subs = self.session_subscribers.write().await;
+        let mut subs = self.session_subscribers.write().unwrap();
         if subs.contains_key(&session_id) {
-            return Err(Error::Session(format!("session {} already attached", session_id)));
+            return Err(Error::Session(format!(
+                "session {} already attached",
+                session_id
+            )));
         }
         subs.insert(session_id, tx);
         Ok(())
     }
 
-    /// Remove a subscriber for a specific session
-    pub async fn remove_session_subscriber(&self, session_id: u32) {
-        let mut subs = self.session_subscribers.write().await;
+    /// Remove a subscriber for a specific session.
+    pub fn remove_session_subscriber(&self, session_id: u32) {
+        let mut subs = self.session_subscribers.write().unwrap();
         subs.remove(&session_id);
+        self.dropped_event_counts
+            .lock()
+            .unwrap()
+            .remove(&session_id);
     }
 
-    /// Create a new PTY session
-    pub async fn create(&self, opts: CreateOptions) -> Result<u32> {
+    /// Create a new PTY session. Spawns a dedicated reader OS thread.
+    pub fn create(&self, opts: CreateOptions) -> Result<u32> {
         let cfg = config();
 
-        // Check max sessions limit
-        if self.sessions.read().await.len() >= cfg.max_sessions {
+        if self.sessions.read().unwrap().len() >= cfg.max_sessions {
             return Err(Error::LimitReached("max sessions reached".into()));
         }
 
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
-        // Spawn PTY process
         let cwd = opts.cwd.as_deref().unwrap_or(".");
         let cols = opts.cols.unwrap_or(80);
         let rows = opts.rows.unwrap_or(24);
         validate_terminal_size(cols, rows)?;
 
-        let pty = PtyHandle::spawn(
-            cwd,
-            opts.shell.as_deref(),
-            opts.env.as_ref(),
-            cols,
-            rows,
-        )?;
+        let pty = PtyHandle::spawn(cwd, opts.shell.as_deref(), opts.env.as_ref(), cols, rows)?;
+
+        let master_fd = pty.master_fd;
 
         let now = SystemTime::now();
         let now_nanos = now.duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
@@ -135,255 +252,559 @@ impl Manager {
         let session = Arc::new(Session {
             id,
             pty,
-            emulator: tokio::sync::Mutex::new(Emulator::new(cols, rows, cfg.scrollback_lines)),
+            emulator: Mutex::new(Emulator::new(cols, rows, cfg.scrollback_lines)),
             running: AtomicBool::new(true),
+            lifecycle: AtomicU8::new(SessionLifecycleState::Alive as u8),
+            reader_eof: AtomicBool::new(false),
+            exit_status: Mutex::new(None),
+            input_queue: Mutex::new(VecDeque::new()),
+            input_queue_bytes: AtomicUsize::new(0),
+            input_backoff_ms: AtomicU64::new(0),
+            input_backoff_until_ms: AtomicU64::new(0),
             created_at: now,
             last_attached: AtomicU64::new(now_nanos),
         });
 
-        // Insert session
-        self.sessions.write().await.insert(id, session.clone());
+        self.sessions.write().unwrap().insert(id, session.clone());
+        self.pid_to_session
+            .write()
+            .unwrap()
+            .insert(session.pty.child_pid, id);
 
-        // Start async PTY reader task
-        let subscribers = self.session_subscribers.clone();
-        tokio::spawn(async move {
-            start_reader(session, subscribers).await;
-        });
+        // Spawn a dedicated OS reader thread for this session's PTY.
+        let tx = self.reader_tx.clone();
+        let wakeup_fd = self.wakeup_write_fd;
+        let session_clone = session.clone();
+        std::thread::Builder::new()
+            .name(format!("pty-reader-{}", id))
+            .spawn(move || {
+                reader_thread(id, master_fd, tx, wakeup_fd, &session_clone.running);
+            })
+            .map_err(|e| Error::Session(format!("failed to spawn reader thread: {}", e)))?;
 
         Ok(id)
     }
 
-    pub async fn get(&self, id: u32) -> Option<Arc<Session>> {
-        self.sessions.read().await.get(&id).cloned()
+    pub fn get(&self, id: u32) -> Option<Arc<Session>> {
+        self.sessions.read().unwrap().get(&id).cloned()
     }
 
-    pub async fn list(&self) -> Vec<SessionInfo> {
+    pub fn list(&self) -> Vec<SessionInfo> {
         self.sessions
             .read()
-            .await
+            .unwrap()
             .values()
             .map(|s| s.to_info())
             .collect()
     }
 
-    pub async fn kill(&self, id: u32) -> Result<()> {
+    pub fn kill(&self, id: u32) -> Result<()> {
         let session = self
             .sessions
             .read()
-            .await
+            .unwrap()
             .get(&id)
             .cloned()
             .ok_or_else(|| Error::NotFound(format!("session {}", id)))?;
-        self.terminate_and_finalize(id, session).await
+        self.terminate_and_finalize_nonblocking(id, session)
     }
 
-    pub async fn kill_all(&self) -> usize {
+    pub fn kill_all(&self) -> usize {
         let sessions: Vec<(u32, Arc<Session>)> = self
             .sessions
             .read()
-            .await
+            .unwrap()
             .iter()
             .map(|(id, session)| (*id, session.clone()))
             .collect();
         let mut count = 0;
 
         for (id, session) in sessions {
-            if self.terminate_and_finalize(id, session).await.is_ok() {
+            if self.terminate_and_finalize_nonblocking(id, session).is_ok() {
                 count += 1;
+            } else {
+                eprintln!("[manager] Failed to terminate session {}", id);
             }
         }
 
         count
     }
 
-    pub async fn signal(&self, id: u32, signal: &str) -> Result<()> {
-        let sessions = self.sessions.read().await;
+    pub fn signal(&self, id: u32, signal: &str) -> Result<()> {
+        let sessions = self.sessions.read().unwrap();
         let session = sessions
             .get(&id)
             .ok_or_else(|| Error::NotFound(format!("session {}", id)))?;
+
+        if session.lifecycle_state() != SessionLifecycleState::Alive {
+            return Err(Error::Session(format!("session {} is terminating", id)));
+        }
 
         let sig = parse_signal(signal)?;
         session.pty.send_signal(sig)?;
         Ok(())
     }
 
-    pub async fn resize(&self, id: u32, cols: u16, rows: u16) -> Result<()> {
+    pub fn resize(&self, id: u32, cols: u16, rows: u16) -> Result<()> {
         validate_terminal_size(cols, rows)?;
 
-        let sessions = self.sessions.read().await;
+        let sessions = self.sessions.read().unwrap();
         let session = sessions
             .get(&id)
             .ok_or_else(|| Error::NotFound(format!("session {}", id)))?;
+
+        if session.lifecycle_state() != SessionLifecycleState::Alive {
+            return Err(Error::Session(format!("session {} is terminating", id)));
+        }
 
         session.pty.resize(cols, rows)?;
-        session.emulator.lock().await.resize(cols, rows);
+        session.emulator.lock().unwrap().resize(cols, rows);
         Ok(())
     }
 
-    pub async fn clear_scrollback(&self, id: u32) -> Result<()> {
-        let sessions = self.sessions.read().await;
+    pub fn clear_scrollback(&self, id: u32) -> Result<()> {
+        let sessions = self.sessions.read().unwrap();
         let session = sessions
             .get(&id)
             .ok_or_else(|| Error::NotFound(format!("session {}", id)))?;
 
-        session.emulator.lock().await.clear_scrollback();
+        if session.lifecycle_state() != SessionLifecycleState::Alive {
+            return Err(Error::Session(format!("session {} is terminating", id)));
+        }
+
+        session.emulator.lock().unwrap().clear_scrollback();
         Ok(())
     }
 
-    /// Clean up a finished session
-    async fn finalize(&self, id: u32) {
-        // Remove from sessions
-        let session = self.sessions.write().await.remove(&id);
+    pub fn enqueue_input(&self, id: u32, data: Vec<u8>) -> Result<()> {
+        let session = self
+            .sessions
+            .read()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| Error::NotFound(format!("session {}", id)))?;
 
-        // Remove all subscribers
-        self.session_subscribers.write().await.remove(&id);
+        if session.lifecycle_state() != SessionLifecycleState::Alive {
+            return Err(Error::Session(format!("session {} is terminating", id)));
+        }
+
+        let limit = config().input_queue_max_bytes;
+        let incoming = data.len();
+        let current = session.input_queue_bytes.load(Ordering::Relaxed);
+        let next = current.saturating_add(incoming);
+        if next > limit {
+            return Err(Error::LimitReached(format!(
+                "input queue limit exceeded for session {} ({} > {})",
+                id, next, limit
+            )));
+        }
+
+        let mut queue = session.input_queue.lock().unwrap();
+        queue.push_back(data);
+        session
+            .input_queue_bytes
+            .store(queue.iter().map(Vec::len).sum(), Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    pub fn flush_input_queues(&self) {
+        let now_ms = epoch_millis();
+        let sessions: Vec<Arc<Session>> = self.sessions.read().unwrap().values().cloned().collect();
+
+        for session in sessions {
+            if session.lifecycle_state() != SessionLifecycleState::Alive {
+                continue;
+            }
+
+            let retry_at = session.input_backoff_until_ms.load(Ordering::Relaxed);
+            if retry_at > now_ms {
+                continue;
+            }
+
+            self.flush_session_input(&session, now_ms);
+        }
+    }
+
+    fn flush_session_input(&self, session: &Arc<Session>, now_ms: u64) {
+        loop {
+            if session.lifecycle_state() != SessionLifecycleState::Alive {
+                return;
+            }
+
+            let mut queue = session.input_queue.lock().unwrap();
+            let Some(front) = queue.front_mut() else {
+                session.input_queue_bytes.store(0, Ordering::Relaxed);
+                session.input_backoff_ms.store(0, Ordering::Relaxed);
+                session.input_backoff_until_ms.store(0, Ordering::Relaxed);
+                return;
+            };
+
+            match session.pty.write(front) {
+                Ok(0) => {
+                    let backoff = next_backoff_ms(&session);
+                    session
+                        .input_backoff_until_ms
+                        .store(now_ms.saturating_add(backoff), Ordering::Relaxed);
+                    return;
+                }
+                Ok(written) => {
+                    if written >= front.len() {
+                        let consumed = front.len();
+                        queue.pop_front();
+                        let remaining = session
+                            .input_queue_bytes
+                            .load(Ordering::Relaxed)
+                            .saturating_sub(consumed);
+                        session
+                            .input_queue_bytes
+                            .store(remaining, Ordering::Relaxed);
+                    } else {
+                        front.drain(..written);
+                        let remaining = session
+                            .input_queue_bytes
+                            .load(Ordering::Relaxed)
+                            .saturating_sub(written);
+                        session
+                            .input_queue_bytes
+                            .store(remaining, Ordering::Relaxed);
+                    }
+
+                    session.input_backoff_ms.store(0, Ordering::Relaxed);
+                    session.input_backoff_until_ms.store(0, Ordering::Relaxed);
+                }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                    continue;
+                }
+                Err(err)
+                    if err.kind() == io::ErrorKind::WouldBlock
+                        || err.raw_os_error() == Some(libc::EAGAIN)
+                        || err.raw_os_error() == Some(libc::EWOULDBLOCK)
+                        || err.raw_os_error() == Some(libc::EIO)
+                        || err.raw_os_error() == Some(libc::ENXIO) =>
+                {
+                    let backoff = next_backoff_ms(&session);
+                    session
+                        .input_backoff_until_ms
+                        .store(now_ms.saturating_add(backoff), Ordering::Relaxed);
+                    return;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[manager] Failed writing queued PTY input for session {}: {}",
+                        session.id, err
+                    );
+                    queue.clear();
+                    session.input_queue_bytes.store(0, Ordering::Relaxed);
+                    session.input_backoff_ms.store(0, Ordering::Relaxed);
+                    session.input_backoff_until_ms.store(0, Ordering::Relaxed);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Drain all pending reader events from the channel.
+    /// Called by the main event loop after the wakeup pipe becomes readable.
+    /// Also drains the wakeup pipe.
+    pub fn drain_reader_events(&self, wakeup_read_fd: i32) -> Vec<ReaderEvent> {
+        // Drain the wakeup pipe so it doesn't keep firing.
+        let mut drain_buf = [0u8; 256];
+        loop {
+            let n = unsafe {
+                libc::read(
+                    wakeup_read_fd,
+                    drain_buf.as_mut_ptr().cast(),
+                    drain_buf.len(),
+                )
+            };
+            if n <= 0 {
+                break;
+            }
+        }
+
+        let rx = self.reader_rx.lock().unwrap();
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    /// Process a batch of reader events: feed emulator, broadcast to subscribers.
+    /// Returns a list of (session_id, data) pairs that need to be sent to clients.
+    pub fn process_reader_events(&self, events: Vec<ReaderEvent>) -> Vec<(u32, OutputEvent)> {
+        // Group data events by session for coalescing.
+        let mut session_data: HashMap<u32, Vec<Vec<u8>>> = HashMap::new();
+        let mut eof_sessions: Vec<u32> = Vec::new();
+
+        for event in events {
+            match event {
+                ReaderEvent::Data { session, data } => {
+                    session_data.entry(session).or_default().push(data);
+                }
+                ReaderEvent::Eof { session } => {
+                    eof_sessions.push(session);
+                }
+            }
+        }
+
+        let mut output = Vec::new();
+
+        // Process data events: coalesce per-session, feed emulator, broadcast.
+        for (session_id, chunks) in session_data {
+            // Coalesce all chunks for this session into one.
+            let total_len: usize = chunks.iter().map(|c| c.len()).sum();
+            let mut coalesced = Vec::with_capacity(total_len);
+            for chunk in chunks {
+                coalesced.extend_from_slice(&chunk);
+            }
+
+            // Feed emulator and drain write-backs.
+            if let Some(session) = self.get(session_id) {
+                if let Ok(mut emulator) = session.emulator.lock() {
+                    emulator.process_bytes(&coalesced);
+                    for response in emulator.drain_pty_writes() {
+                        let _ = session.pty.write(response.as_bytes());
+                    }
+                }
+            }
+
+            output.push((
+                session_id,
+                OutputEvent::Data {
+                    session: session_id,
+                    data: coalesced,
+                },
+            ));
+        }
+
+        // Process EOF events.
+        for session_id in eof_sessions {
+            if let Some(session) = self.get(session_id) {
+                session.running.store(false, Ordering::SeqCst);
+                session.mark_terminating();
+                session.reader_eof.store(true, Ordering::SeqCst);
+                if let Some(exit_event) = self.maybe_finalize_session(session_id) {
+                    output.push(exit_event);
+                }
+            }
+        }
+
+        output
+    }
+
+    /// Reap all exited children without blocking.
+    /// Call this on SIGCHLD and periodically in the main loop.
+    pub fn reap_exited_children(&self) -> Vec<(u32, OutputEvent)> {
+        let mut output = Vec::new();
+
+        loop {
+            let mut status: libc::c_int = 0;
+            let pid = unsafe { libc::waitpid(-1, &mut status as *mut libc::c_int, libc::WNOHANG) };
+
+            if pid == 0 {
+                break;
+            }
+
+            if pid < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+
+            let exit_status = decode_wait_status(status);
+            let session_id = self.pid_to_session.read().unwrap().get(&pid).copied();
+
+            if let Some(session_id) = session_id {
+                if let Some(session) = self.get(session_id) {
+                    session.mark_terminating();
+                    *session.exit_status.lock().unwrap() = Some(exit_status);
+                    if let Some(exit_event) = self.maybe_finalize_session(session_id) {
+                        output.push(exit_event);
+                    }
+                }
+            }
+        }
+
+        output
+    }
+
+    /// Broadcast an output event to the subscriber for a session (if any).
+    pub fn broadcast_event(&self, session_id: u32, event: &OutputEvent) {
+        let tx = {
+            let subs = self.session_subscribers.read().unwrap();
+            subs.get(&session_id).cloned()
+        };
+
+        if let Some(tx) = tx {
+            match tx.try_send(event.clone()) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    let mut drops = self.dropped_event_counts.lock().unwrap();
+                    let entry = drops.entry(session_id).or_insert(0);
+                    *entry = entry.saturating_add(1);
+
+                    // Log on powers of two to avoid flooding logs under sustained pressure.
+                    if *entry == 1 || (*entry & (*entry - 1)) == 0 {
+                        eprintln!(
+                            "[manager] Session {} output backpressured; dropped {} event(s)",
+                            session_id, entry
+                        );
+                    }
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    eprintln!(
+                        "[manager] Session {} subscriber disconnected; removing subscriber",
+                        session_id
+                    );
+                    self.remove_session_subscriber(session_id);
+                }
+            }
+        }
+    }
+
+    /// Clean up a finished session.
+    pub fn finalize(&self, id: u32) {
+        let session = self.sessions.write().unwrap().remove(&id);
+        self.session_subscribers.write().unwrap().remove(&id);
+        self.dropped_event_counts.lock().unwrap().remove(&id);
 
         if let Some(sess) = session {
             sess.running.store(false, Ordering::SeqCst);
+            sess.mark_dead();
+            self.pid_to_session
+                .write()
+                .unwrap()
+                .remove(&sess.pty.child_pid);
         }
     }
 
-    async fn terminate_and_finalize(&self, id: u32, session: Arc<Session>) -> Result<()> {
-        // `kill` should be definitive: use SIGKILL to avoid lingering sessions.
-        session.pty.send_signal(libc::SIGKILL)?;
+    fn terminate_nonblocking(&self, session: Arc<Session>) -> Result<()> {
+        session.try_mark_terminating()?;
 
-        let (exit_code, exit_signal) = wait_for_child_with_timeout(
-            session.pty.child_pid,
-            Duration::from_millis(250),
-        )
-        .await
-        .unwrap_or((128 + libc::SIGKILL, Some(libc::SIGKILL)));
-
-        broadcast_to_subscribers(
-            &self.session_subscribers,
-            id,
-            OutputEvent::Exit {
-                session: id,
-                code: exit_code,
-                signal: exit_signal,
-            },
-        )
-        .await;
-
-        self.finalize(id).await;
+        if let Err(err) = session.pty.send_signal(libc::SIGKILL) {
+            // Process may have already exited between lookup and kill.
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                return Err(err.into());
+            }
+        }
+        session.running.store(false, Ordering::SeqCst);
         Ok(())
     }
-}
 
-/// Async PTY reader task (replaces the blocking thread)
-async fn start_reader(
-    session: Arc<Session>,
-    subscribers: Arc<tokio::sync::RwLock<HashMap<u32, tokio::sync::mpsc::Sender<OutputEvent>>>>,
-) {
-    let master_fd = session.pty.master_fd;
-    let session_id = session.id;
+    fn terminate_and_finalize_nonblocking(&self, id: u32, session: Arc<Session>) -> Result<()> {
+        self.terminate_nonblocking(session)?;
 
-    // Create async file from raw fd
-    let std_file = unsafe {
-        use std::os::fd::FromRawFd;
-        std::fs::File::from_raw_fd(master_fd)
-    };
+        self.broadcast_event(
+            id,
+            &OutputEvent::Exit {
+                session: id,
+                code: 128 + libc::SIGKILL,
+                signal: Some(libc::SIGKILL),
+            },
+        );
+        self.finalize(id);
+        Ok(())
+    }
 
-    // Convert to tokio file for async operations
-    let mut file = tokio::fs::File::from_std(std_file);
-
-    let mut buf = [0u8; 8192];
-
-    while session.running.load(Ordering::Relaxed) {
-        use tokio::io::AsyncReadExt;
-
-        match file.read(&mut buf).await {
-            Ok(0) => {
-                // EOF - PTY closed
-                break;
-            }
-            Ok(n) => {
-                let data = buf[..n].to_vec();
-
-                // Update emulator
-                if let Ok(mut emulator) = session.emulator.try_lock() {
-                    for &byte in &data {
-                        emulator.process_byte(byte);
-                    }
-                }
-
-                // Broadcast to subscribers
-                let event = OutputEvent::Data {
-                    session: session_id,
-                    data,
-                };
-                broadcast_to_subscribers(&subscribers, session_id, event).await;
-            }
-            Err(e) => {
-                eprintln!("[reader] Error reading PTY: {}", e);
-                break;
-            }
+    fn maybe_finalize_session(&self, session_id: u32) -> Option<(u32, OutputEvent)> {
+        let session = self.get(session_id)?;
+        if session.lifecycle_state() == SessionLifecycleState::Dead {
+            return None;
         }
-    }
+        if !session.reader_eof.load(Ordering::SeqCst) {
+            return None;
+        }
 
-    // Mark session as not running
-    session.running.store(false, Ordering::SeqCst);
-
-    // Get exit status
-    let (exit_code, exit_signal) = wait_for_child(session.pty.child_pid).await;
-
-    // Send exit event
-    let exit_event = OutputEvent::Exit {
-        session: session_id,
-        code: exit_code,
-        signal: exit_signal,
-    };
-    broadcast_to_subscribers(&subscribers, session_id, exit_event).await;
-
-    // Clean up session
-    if let Some(mgr) = MANAGER.get() {
-        mgr.finalize(session_id).await;
+        let (code, signal) = (*session.exit_status.lock().unwrap())?;
+        self.finalize(session_id);
+        Some((
+            session_id,
+            OutputEvent::Exit {
+                session: session_id,
+                code,
+                signal,
+            },
+        ))
     }
 }
 
-/// Helper to broadcast events
-async fn broadcast_to_subscribers(
-    subscribers: &Arc<tokio::sync::RwLock<HashMap<u32, tokio::sync::mpsc::Sender<OutputEvent>>>>,
+/// Dedicated OS thread that reads from a PTY master fd.
+/// Sends data chunks to the main event loop via a sync channel.
+fn reader_thread(
     session_id: u32,
-    event: OutputEvent,
+    master_fd: i32,
+    tx: std::sync::mpsc::SyncSender<ReaderEvent>,
+    wakeup_fd: i32,
+    running: &AtomicBool,
 ) {
-    let subs = subscribers.read().await;
-    let Some(tx) = subs.get(&session_id) else {
-        return;
-    };
+    let mut buf = [0u8; 65536];
 
-    let cfg = config();
+    while running.load(Ordering::Relaxed) {
+        let n = unsafe { libc::read(master_fd, buf.as_mut_ptr().cast(), buf.len()) };
 
-    match tx.try_send(event) {
-        Ok(_) => {
-            let remaining = tx.capacity();
-            if remaining < cfg.flow_threshold {
-                let queue_size = cfg.flow_max_queue_size - remaining;
-                let warning = OutputEvent::BackpressureWarning {
-                    session: session_id,
-                    queue_size,
-                    level: BackpressureLevel::Yellow,
-                };
-                let _ = tx.try_send(warning);
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
             }
-        }
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-            if !cfg.flow_auto_disconnect {
-                let warning = OutputEvent::BackpressureWarning {
-                    session: session_id,
-                    queue_size: cfg.flow_max_queue_size,
-                    level: BackpressureLevel::Red,
-                };
-                let _ = tx.try_send(warning);
+            if err.kind() == io::ErrorKind::WouldBlock {
+                continue;
             }
+            break;
         }
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-            // Subscriber disconnected
+
+        if n == 0 {
+            // EOF — PTY closed.
+            break;
         }
+
+        let data = buf[..n as usize].to_vec();
+        if tx
+            .send(ReaderEvent::Data {
+                session: session_id,
+                data,
+            })
+            .is_err()
+        {
+            break;
+        }
+
+        // Wake up the main polling loop.
+        let byte = [1u8];
+        unsafe { libc::write(wakeup_fd, byte.as_ptr().cast(), 1) };
     }
+
+    // Notify main loop that this reader is done.
+    let _ = tx.send(ReaderEvent::Eof {
+        session: session_id,
+    });
+    let byte = [1u8];
+    unsafe { libc::write(wakeup_fd, byte.as_ptr().cast(), 1) };
 }
 
-/// Parse signal name to signal number
+fn epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn next_backoff_ms(session: &Session) -> u64 {
+    let current = session.input_backoff_ms.load(Ordering::Relaxed);
+    let next = if current == 0 {
+        INPUT_WRITE_BACKOFF_MIN_MS
+    } else {
+        (current.saturating_mul(2)).min(INPUT_WRITE_BACKOFF_MAX_MS)
+    };
+    session.input_backoff_ms.store(next, Ordering::Relaxed);
+    next
+}
+
 fn parse_signal(name: &str) -> Result<i32> {
     match name.to_uppercase().as_str() {
         "HUP" | "SIGHUP" => Ok(libc::SIGHUP),
@@ -399,51 +820,6 @@ fn parse_signal(name: &str) -> Result<i32> {
         "WINCH" | "SIGWINCH" => Ok(libc::SIGWINCH),
         _ => Err(Error::Session(format!("unknown signal: {}", name))),
     }
-}
-
-/// Wait for child process to exit and return its real exit status.
-async fn wait_for_child(pid: i32) -> (i32, Option<i32>) {
-    tokio::task::spawn_blocking(move || wait_for_child_blocking(pid))
-        .await
-        .unwrap_or((0, None))
-}
-
-async fn wait_for_child_with_timeout(pid: i32, timeout: Duration) -> Option<(i32, Option<i32>)> {
-    let deadline = tokio::time::Instant::now() + timeout;
-
-    loop {
-        if let Some(status) = try_wait_for_child(pid) {
-            return Some(status);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return None;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
-fn try_wait_for_child(pid: i32) -> Option<(i32, Option<i32>)> {
-    let mut status: libc::c_int = 0;
-    let result = unsafe { libc::waitpid(pid, &mut status as *mut libc::c_int, libc::WNOHANG) };
-
-    if result == 0 {
-        return None;
-    }
-    if result < 0 {
-        return Some((0, None));
-    }
-    Some(decode_wait_status(status))
-}
-
-fn wait_for_child_blocking(pid: i32) -> (i32, Option<i32>) {
-    let mut status: libc::c_int = 0;
-    let result = unsafe { libc::waitpid(pid, &mut status as *mut libc::c_int, 0) };
-
-    if result < 0 {
-        return (0, None);
-    }
-
-    decode_wait_status(status)
 }
 
 fn decode_wait_status(status: libc::c_int) -> (i32, Option<i32>) {

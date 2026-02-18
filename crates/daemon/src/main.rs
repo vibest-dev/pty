@@ -6,15 +6,32 @@ mod server;
 mod session;
 
 use config::config;
-use server::handle_connection;
+use polling::{Event, Events, Poller};
+use protocol::{ConnectionRole, Request, RequestEnvelope, Response};
+use server::{handle_request, ClientState};
+use session::manager::{Manager, MANAGER};
+use std::collections::HashMap;
 use std::fs;
+use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixListener;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::time::Duration;
 
-#[tokio::main]
-async fn main() {
+// Poller key assignments:
+// 0            = Unix listener (accept)
+// 1            = Shutdown signal pipe (SIGINT/SIGTERM/SIGHUP)
+// 2            = SIGCHLD signal pipe
+// 3            = Wakeup pipe (PTY reader data available)
+// 100+         = Client connections (key = 100 + client_id)
+const KEY_LISTENER: usize = 0;
+const KEY_SIGNAL: usize = 1;
+const KEY_SIGCHLD: usize = 2;
+const KEY_WAKEUP: usize = 3;
+const KEY_CLIENT_BASE: usize = 100;
+
+fn main() {
     let cfg = config();
 
     eprintln!(
@@ -34,8 +51,8 @@ async fn main() {
         return;
     }
 
-    // Bind using std::os::unix::net::UnixListener (for prepare_socket compatibility)
-    let listener = match std::os::unix::net::UnixListener::bind(&cfg.socket_path) {
+    // Bind Unix listener
+    let listener = match UnixListener::bind(&cfg.socket_path) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("[daemon] Failed to bind socket: {}", e);
@@ -56,57 +73,336 @@ async fn main() {
         eprintln!("[daemon] Warning: failed to write PID file: {}", e);
     }
 
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut sigint = signal(SignalKind::interrupt()).expect("Failed to install SIGINT handler");
-    let mut sigterm = signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
-    let mut sighup = signal(SignalKind::hangup()).expect("Failed to install SIGHUP handler");
+    // Set up signal handling via self-pipe trick.
+    let (signal_read, signal_write) = match std::os::unix::net::UnixStream::pair() {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("[daemon] Failed to create shutdown signal pipe: {}", e);
+            return;
+        }
+    };
+    let (sigchld_read, sigchld_write) = match std::os::unix::net::UnixStream::pair() {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("[daemon] Failed to create SIGCHLD signal pipe: {}", e);
+            return;
+        }
+    };
+    signal_read.set_nonblocking(true).unwrap();
+    signal_write.set_nonblocking(true).unwrap();
+    sigchld_read.set_nonblocking(true).unwrap();
+    sigchld_write.set_nonblocking(true).unwrap();
+
+    let signal_write_fd = signal_write.as_raw_fd();
+    let sigchld_write_fd = sigchld_write.as_raw_fd();
+    // register_raw uses the raw fd without taking ownership, so the writers stay alive.
+    if let Err(e) = signal_hook::low_level::pipe::register_raw(libc::SIGINT, signal_write_fd) {
+        eprintln!("[daemon] Failed to register SIGINT handler: {}", e);
+        return;
+    }
+    if let Err(e) = signal_hook::low_level::pipe::register_raw(libc::SIGTERM, signal_write_fd) {
+        eprintln!("[daemon] Failed to register SIGTERM handler: {}", e);
+        return;
+    }
+    if let Err(e) = signal_hook::low_level::pipe::register_raw(libc::SIGHUP, signal_write_fd) {
+        eprintln!("[daemon] Failed to register SIGHUP handler: {}", e);
+        return;
+    }
+    if let Err(e) = signal_hook::low_level::pipe::register_raw(libc::SIGCHLD, sigchld_write_fd) {
+        eprintln!("[daemon] Failed to register SIGCHLD handler: {}", e);
+        return;
+    }
+
+    // Create the manager with its wakeup pipe.
+    let (mgr, wakeup_read_fd) = Manager::new_with_wakeup();
+    if MANAGER.set(mgr).is_err() {
+        eprintln!("[daemon] Failed to set MANAGER (already initialized)");
+        return;
+    }
+
+    // Create the poller.
+    let poller = match Poller::new() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[daemon] Failed to create poller: {}", e);
+            return;
+        }
+    };
+
+    // Register the listener for accept events.
+    unsafe {
+        if let Err(e) = poller.add(listener.as_raw_fd(), Event::readable(KEY_LISTENER)) {
+            eprintln!("[daemon] Failed to register listener: {}", e);
+            return;
+        }
+    }
+
+    // Register shutdown signal pipe for readable events.
+    unsafe {
+        if let Err(e) = poller.add(signal_read.as_raw_fd(), Event::readable(KEY_SIGNAL)) {
+            eprintln!("[daemon] Failed to register shutdown signal pipe: {}", e);
+            return;
+        }
+    }
+
+    // Register SIGCHLD signal pipe for readable events.
+    unsafe {
+        if let Err(e) = poller.add(sigchld_read.as_raw_fd(), Event::readable(KEY_SIGCHLD)) {
+            eprintln!("[daemon] Failed to register SIGCHLD pipe: {}", e);
+            return;
+        }
+    }
+
+    // Register the wakeup pipe for readable events.
+    unsafe {
+        if let Err(e) = poller.add(wakeup_read_fd, Event::readable(KEY_WAKEUP)) {
+            eprintln!("[daemon] Failed to register wakeup pipe: {}", e);
+            return;
+        }
+    }
 
     eprintln!("[daemon] Listening on {}", cfg.socket_path);
     eprintln!("[daemon] PID: {}", std::process::id());
 
-    let active = Arc::new(AtomicU32::new(0));
+    let mut events = Events::new();
+    let mut clients: HashMap<usize, ClientState> = HashMap::new();
+    let mut next_client_id: usize = 0;
+    let mut active_connections: u32 = 0;
 
-    // Convert to tokio UnixListener
-    let listener = tokio::net::UnixListener::from_std(listener).expect("Failed to convert listener");
+    let coalesce_timeout = Duration::from_millis(cfg.coalesce_delay_ms);
 
-    // Async accept loop - no polling needed!
-    loop {
-        tokio::select! {
-            result = listener.accept() => {
-                match result {
-                    Ok((stream, _)) => {
-                        let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+    // Main event loop
+    'main: loop {
+        let mgr = session::manager::manager();
+        events.clear();
 
-                        if count > cfg.max_connections {
-                            active.fetch_sub(1, Ordering::SeqCst);
-                            eprintln!("[daemon] Connection limit reached, rejecting");
-                            continue;
+        // Poll with the coalesce delay as timeout. This serves double duty:
+        // it's the maximum time between checking for PTY output and also
+        // prevents busy-waiting when idle.
+        if let Err(e) = poller.wait(&mut events, Some(coalesce_timeout)) {
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            eprintln!("[daemon] Poll error: {}", e);
+            break;
+        }
+
+        for event in events.iter() {
+            match event.key {
+                KEY_LISTENER => {
+                    // Accept new connections
+                    loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                if active_connections >= cfg.max_connections {
+                                    eprintln!("[daemon] Connection limit reached, rejecting");
+                                    drop(stream);
+                                    continue;
+                                }
+
+                                let client_id = next_client_id;
+                                next_client_id += 1;
+                                let key = KEY_CLIENT_BASE + client_id;
+
+                                match ClientState::new(stream) {
+                                    Ok(client) => {
+                                        unsafe {
+                                            if let Err(e) = poller.add(
+                                                client.stream.as_raw_fd(),
+                                                Event::readable(key),
+                                            ) {
+                                                eprintln!(
+                                                    "[daemon] Failed to register client: {}",
+                                                    e
+                                                );
+                                                continue;
+                                            }
+                                        }
+                                        clients.insert(client_id, client);
+                                        active_connections += 1;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[daemon] Failed to create client state: {}", e);
+                                    }
+                                }
+                            }
+                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                            Err(e) => {
+                                eprintln!("[daemon] Accept error: {}", e);
+                                break;
+                            }
                         }
-
-                        let active = Arc::clone(&active);
-                        tokio::spawn(async move {
-                            handle_connection(stream).await;
-                            active.fetch_sub(1, Ordering::SeqCst);
-                        });
                     }
-                    Err(e) => {
-                        eprintln!("[daemon] Accept error: {}", e);
+
+                    // Re-register listener for next event (oneshot mode).
+                    if let Err(e) = poller.modify(&listener, Event::readable(KEY_LISTENER)) {
+                        eprintln!("[daemon] Failed to re-register listener: {}", e);
+                        break 'main;
                     }
                 }
-            }
-            _ = sigint.recv() => {
-                eprintln!("[daemon] Received SIGINT, shutting down...");
-                break;
-            }
-            _ = sigterm.recv() => {
-                eprintln!("[daemon] Received SIGTERM, shutting down...");
-                break;
-            }
-            _ = sighup.recv() => {
-                eprintln!("[daemon] Received SIGHUP, shutting down...");
-                break;
+
+                KEY_SIGNAL => {
+                    // Drain shutdown signal pipe and exit.
+                    let mut buf = [0u8; 64];
+                    loop {
+                        let n = unsafe {
+                            libc::read(signal_read.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len())
+                        };
+
+                        if n < 0 {
+                            let err = io::Error::last_os_error();
+                            if err.kind() == io::ErrorKind::Interrupted {
+                                continue;
+                            }
+                            if err.kind() == io::ErrorKind::WouldBlock {
+                                break;
+                            }
+                            eprintln!("[daemon] Shutdown signal pipe read error: {}", err);
+                            break;
+                        }
+                        if n == 0 {
+                            break;
+                        }
+                    }
+
+                    if let Err(e) = poller.modify(&signal_read, Event::readable(KEY_SIGNAL)) {
+                        eprintln!("[daemon] Failed to re-register signal pipe: {}", e);
+                        break 'main;
+                    }
+
+                    eprintln!("[daemon] Received shutdown signal, shutting down...");
+                    break 'main;
+                }
+
+                KEY_SIGCHLD => {
+                    // Drain SIGCHLD pipe and reap children without blocking.
+                    let mut buf = [0u8; 64];
+                    loop {
+                        let n = unsafe {
+                            libc::read(sigchld_read.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len())
+                        };
+                        if n < 0 {
+                            let err = io::Error::last_os_error();
+                            if err.kind() == io::ErrorKind::Interrupted {
+                                continue;
+                            }
+                            if err.kind() == io::ErrorKind::WouldBlock {
+                                break;
+                            }
+                            eprintln!("[daemon] SIGCHLD pipe read error: {}", err);
+                            break;
+                        }
+                        if n == 0 {
+                            break;
+                        }
+                    }
+
+                    for (session_id, event) in mgr.reap_exited_children() {
+                        mgr.broadcast_event(session_id, &event);
+                    }
+
+                    if let Err(e) = poller.modify(&sigchld_read, Event::readable(KEY_SIGCHLD)) {
+                        eprintln!("[daemon] Failed to re-register SIGCHLD pipe: {}", e);
+                        break 'main;
+                    }
+                }
+
+                KEY_WAKEUP => {
+                    // PTY reader data available — handled below after event processing.
+                    // Re-register wakeup pipe.
+                    let _ = poller.modify(
+                        unsafe { std::os::unix::io::BorrowedFd::borrow_raw(wakeup_read_fd) },
+                        Event::readable(KEY_WAKEUP),
+                    );
+                }
+
+                key if key >= KEY_CLIENT_BASE => {
+                    let client_id = key - KEY_CLIENT_BASE;
+
+                    let mut requests = Vec::new();
+                    if event.readable {
+                        if let Some(client) = clients.get_mut(&client_id) {
+                            client.read_from_stream();
+                            requests = client.drain_requests();
+                        }
+                    }
+
+                    for envelope in requests {
+                        if let Some(response) = dispatch_request(&mut clients, client_id, envelope)
+                        {
+                            if let Some(source) = clients.get_mut(&client_id) {
+                                source.queue_response(&response);
+                            }
+                        }
+                    }
+
+                    if event.writable {
+                        if let Some(client) = clients.get_mut(&client_id) {
+                            client.handle_writable();
+                        }
+                    }
+                }
+
+                _ => {}
             }
         }
+
+        // Flush queued PTY input writes with backoff-aware retries.
+        mgr.flush_input_queues();
+
+        // Drain PTY reader events and process them (coalescing).
+        let reader_events = mgr.drain_reader_events(wakeup_read_fd);
+        if !reader_events.is_empty() {
+            let output_events = mgr.process_reader_events(reader_events);
+            for (session_id, event) in &output_events {
+                mgr.broadcast_event(*session_id, event);
+            }
+        }
+        // Reap any exited children in a non-blocking way. This is cheap when
+        // there are no state changes and prevents missed SIGCHLD races.
+        for (session_id, event) in mgr.reap_exited_children() {
+            mgr.broadcast_event(session_id, &event);
+        }
+
+        // Drain session output channels to client write queues.
+        for client in clients.values_mut() {
+            client.drain_session_output();
+        }
+
+        // Update poller registrations and remove dead clients.
+        let mut dead_ids = Vec::new();
+        for (&client_id, client) in clients.iter_mut() {
+            if client.dead {
+                dead_ids.push(client_id);
+                continue;
+            }
+
+            let key = KEY_CLIENT_BASE + client_id;
+            let interest = if client.needs_write {
+                Event::all(key)
+            } else {
+                Event::readable(key)
+            };
+
+            if let Err(e) = poller.modify(&client.stream, interest) {
+                eprintln!("[daemon] Failed to modify client {}: {}", client_id, e);
+                dead_ids.push(client_id);
+            }
+        }
+
+        for client_id in dead_ids {
+            if let Some(mut client) = clients.remove(&client_id) {
+                let _ = poller.delete(&client.stream);
+                client.cleanup();
+                active_connections -= 1;
+            }
+        }
+    }
+
+    // Shutdown: clean up all clients.
+    for (_, mut client) in clients.drain() {
+        let _ = poller.delete(&client.stream);
+        client.cleanup();
     }
 
     eprintln!("[daemon] Shutting down...");
@@ -141,4 +437,55 @@ fn cleanup() {
     let _ = fs::remove_file(&cfg.socket_path);
     let _ = fs::remove_file(&cfg.pid_path);
     auth::cleanup();
+}
+
+fn dispatch_request(
+    clients: &mut HashMap<usize, ClientState>,
+    source_client_id: usize,
+    envelope: RequestEnvelope,
+) -> Option<Response> {
+    let route_to_stream = {
+        let source = clients.get(&source_client_id)?;
+        source.authenticated
+            && source.uses_explicit_role()
+            && source.role == ConnectionRole::Control
+            && matches!(
+                &envelope.request,
+                Request::Attach { .. } | Request::Detach { .. }
+            )
+    };
+
+    if route_to_stream {
+        let client_id = clients
+            .get(&source_client_id)
+            .and_then(|c| c.client_id.clone())
+            .unwrap_or_default();
+
+        let stream_client_id = clients
+            .iter()
+            .find(|(id, c)| {
+                **id != source_client_id
+                    && !c.dead
+                    && c.authenticated
+                    && c.role == ConnectionRole::Stream
+                    && c.client_id.as_deref() == Some(client_id.as_str())
+            })
+            .map(|(id, _)| *id);
+
+        let Some(stream_client_id) = stream_client_id else {
+            return Some(Response::error(
+                envelope.seq,
+                "STREAM_NOT_CONNECTED",
+                "No paired stream channel connected",
+            ));
+        };
+
+        let mut stream_client = clients.remove(&stream_client_id)?;
+        let response = handle_request(&mut stream_client, envelope.seq, envelope.request);
+        clients.insert(stream_client_id, stream_client);
+        return response;
+    }
+
+    let source = clients.get_mut(&source_client_id)?;
+    handle_request(source, envelope.seq, envelope.request)
 }

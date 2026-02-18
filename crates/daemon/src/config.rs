@@ -1,6 +1,5 @@
 use std::sync::OnceLock;
 
-#[allow(dead_code)]
 pub struct Config {
     pub socket_path: String,
     pub token_path: String,
@@ -8,10 +7,10 @@ pub struct Config {
     pub max_connections: u32,
     pub max_sessions: usize,
     pub scrollback_lines: usize,
-    // Simplified flow control settings
-    pub flow_threshold: usize,          // Warning threshold (default 4096)
-    pub flow_max_queue_size: usize,     // Channel capacity (default 16384)
-    pub flow_auto_disconnect: bool,     // Disconnect on full (default false)
+    pub session_event_queue_capacity: usize,
+    pub client_write_queue_bytes: usize,
+    pub input_queue_max_bytes: usize,
+    pub coalesce_delay_ms: u64,
 }
 
 fn default_base_dir() -> String {
@@ -26,13 +25,10 @@ impl Config {
         let socket_path = std::env::var("RUST_PTY_SOCKET_PATH")
             .unwrap_or_else(|_| format!("{}/socket", base_dir));
 
-        let token_path = std::env::var("RUST_PTY_TOKEN_PATH")
-            .unwrap_or_else(|_| format!("{}/token", base_dir));
+        let token_path =
+            std::env::var("RUST_PTY_TOKEN_PATH").unwrap_or_else(|_| format!("{}/token", base_dir));
 
-        let pid_path = format!(
-            "{}.pid",
-            socket_path.trim_end_matches(".sock")
-        );
+        let pid_path = format!("{}.pid", socket_path.trim_end_matches(".sock"));
 
         let max_connections = std::env::var("RUST_PTY_MAX_CONNECTIONS")
             .ok()
@@ -49,36 +45,48 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(10000);
 
-        // Simplified flow control configuration
-        let flow_threshold = std::env::var("RUST_PTY_FLOW_THRESHOLD")
+        // Legacy compatibility knob from older builds. Keep accepted, but
+        // split queue sizing by unit (events vs bytes) in newer settings.
+        let legacy_flow_max_queue_size = std::env::var("RUST_PTY_FLOW_MAX_QUEUE_SIZE")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(4096);
+            .filter(|v: &usize| *v > 0);
 
-        let flow_max_queue_size = std::env::var("RUST_PTY_FLOW_MAX_QUEUE_SIZE")
+        let session_event_queue_capacity = std::env::var("RUST_PTY_SESSION_EVENT_QUEUE_CAPACITY")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(16384);
+            .filter(|v: &usize| *v > 0)
+            .or(legacy_flow_max_queue_size)
+            .unwrap_or(1024);
 
-        let flow_auto_disconnect = std::env::var("RUST_PTY_FLOW_AUTO_DISCONNECT")
+        let client_write_queue_bytes = std::env::var("RUST_PTY_CLIENT_MAX_WRITE_QUEUE_BYTES")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(false);
+            .filter(|v: &usize| *v > 0)
+            .or(legacy_flow_max_queue_size)
+            .unwrap_or(2_000_000);
 
-        // Validation
-        if flow_threshold >= flow_max_queue_size {
-            panic!(
-                "Invalid flow control config: threshold ({}) must be < max queue size ({})",
-                flow_threshold, flow_max_queue_size
-            );
+        let input_queue_max_bytes = std::env::var("RUST_PTY_INPUT_QUEUE_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &usize| *v > 0)
+            .unwrap_or(2_000_000);
+
+        let coalesce_delay_ms = std::env::var("RUST_PTY_COALESCE_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+
+        if session_event_queue_capacity == 0 {
+            panic!("Invalid config: session event queue capacity must be > 0");
         }
 
-        if flow_threshold == 0 {
-            panic!("Invalid flow control config: threshold must be > 0");
+        if client_write_queue_bytes == 0 {
+            panic!("Invalid config: client write queue bytes must be > 0");
         }
 
-        if flow_max_queue_size == 0 {
-            panic!("Invalid flow control config: max queue size must be > 0");
+        if input_queue_max_bytes == 0 {
+            panic!("Invalid config: input queue max bytes must be > 0");
         }
 
         Self {
@@ -88,9 +96,10 @@ impl Config {
             max_connections,
             max_sessions,
             scrollback_lines,
-            flow_threshold,
-            flow_max_queue_size,
-            flow_auto_disconnect,
+            session_event_queue_capacity,
+            client_write_queue_bytes,
+            input_queue_max_bytes,
+            coalesce_delay_ms,
         }
     }
 }

@@ -3,6 +3,19 @@ use std::collections::HashMap;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionRole {
+    Control,
+    Stream,
+}
+
+impl Default for ConnectionRole {
+    fn default() -> Self {
+        Self::Control
+    }
+}
+
 /// Client -> Server messages
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -10,6 +23,10 @@ pub enum Request {
     Handshake {
         token: String,
         protocol_version: u32,
+        #[serde(default)]
+        client_id: Option<String>,
+        #[serde(default)]
+        role: Option<ConnectionRole>,
     },
     Create {
         #[serde(flatten)]
@@ -105,20 +122,6 @@ pub enum Response {
         #[serde(skip_serializing_if = "Option::is_none")]
         signal: Option<i32>,
     },
-    /// Backpressure warning event
-    BackpressureWarning {
-        session: u32,
-        queue_size: usize,
-        level: BackpressureLevel,
-    },
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BackpressureLevel {
-    Green,
-    Yellow,
-    Red,
 }
 
 impl Response {
@@ -215,14 +218,6 @@ pub struct TerminalModes {
 }
 
 impl TerminalModes {
-    pub fn defaults() -> Self {
-        Self {
-            cursor_visible: true,
-            auto_wrap: true,
-            ..Default::default()
-        }
-    }
-
     pub fn to_rehydrate_sequence(&self) -> String {
         let mut seq = String::new();
         if self.application_cursor {

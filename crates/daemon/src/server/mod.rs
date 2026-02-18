@@ -1,3 +1,4 @@
 mod handler;
 
-pub use handler::handle_connection;
+pub(crate) use handler::handle_request;
+pub use handler::ClientState;

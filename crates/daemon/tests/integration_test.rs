@@ -32,6 +32,10 @@ enum Request {
     Handshake {
         token: String,
         protocol_version: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        client_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        role: Option<ConnectionRole>,
     },
     Create {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -70,6 +74,13 @@ enum Request {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ConnectionRole {
+    Control,
+    Stream,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RequestEnvelope {
     seq: u32,
@@ -104,10 +115,7 @@ enum Response {
         data: Vec<u8>,
     },
     #[allow(dead_code)]
-    Exit {
-        session: u32,
-        code: i32,
-    },
+    Exit { session: u32, code: i32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,17 +138,24 @@ struct TestDaemon {
 
 impl TestDaemon {
     fn start() -> Self {
+        Self::start_with_env(&[])
+    }
+
+    fn start_with_env(extra: &[(&str, &str)]) -> Self {
         let (socket_path, token_path) = get_test_paths();
 
         // Cleanup
         let _ = fs::remove_file(&socket_path);
         let _ = fs::remove_file(&token_path);
 
-        let child = Command::new(env!("CARGO_BIN_EXE_vibest-pty-daemon"))
-            .env("RUST_PTY_SOCKET_PATH", &socket_path)
-            .env("RUST_PTY_TOKEN_PATH", &token_path)
-            .spawn()
-            .expect("Failed to start daemon");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_vibest-pty-daemon"));
+        cmd.env("RUST_PTY_SOCKET_PATH", &socket_path)
+            .env("RUST_PTY_TOKEN_PATH", &token_path);
+        for &(k, v) in extra {
+            cmd.env(k, v);
+        }
+
+        let child = cmd.spawn().expect("Failed to start daemon");
 
         // Wait for socket
         for _ in 0..50 {
@@ -279,6 +294,10 @@ impl TestClient {
     }
 
     fn authenticate(&mut self) {
+        self.authenticate_with_channel(None, None);
+    }
+
+    fn authenticate_with_channel(&mut self, client_id: Option<&str>, role: Option<ConnectionRole>) {
         let token = fs::read_to_string(&self.token_path)
             .expect("Cannot read token")
             .trim()
@@ -287,6 +306,8 @@ impl TestClient {
         self.send(&Request::Handshake {
             token,
             protocol_version: PROTOCOL_VERSION,
+            client_id: client_id.map(str::to_string),
+            role,
         });
 
         match self.recv() {
@@ -362,6 +383,8 @@ mod integration_tests {
         client.send(&Request::Handshake {
             token,
             protocol_version: PROTOCOL_VERSION,
+            client_id: None,
+            role: None,
         });
 
         match client.recv() {
@@ -387,6 +410,8 @@ mod integration_tests {
         client.send(&Request::Handshake {
             token: "invalid_token".into(),
             protocol_version: PROTOCOL_VERSION,
+            client_id: None,
+            role: None,
         });
 
         match client.recv() {
@@ -409,6 +434,8 @@ mod integration_tests {
         client.send(&Request::Handshake {
             token,
             protocol_version: 999,
+            client_id: None,
+            role: None,
         });
 
         match client.recv() {
@@ -690,30 +717,32 @@ mod integration_tests {
             data: b"printf '__S1__\\n'\n".to_vec(),
         });
         let mut buffered_outputs: Vec<(u32, String)> = vec![];
-        let wait_for_input_ack = |client: &mut TestClient,
-                                  expected_seq: u32,
-                                  expected_session: u32,
-                                  buffered_outputs: &mut Vec<(u32, String)>| {
-            for _ in 0..80 {
-                let Some(resp) = client.recv_with_timeout(Duration::from_millis(100)) else {
-                    continue;
-                };
-                match resp {
-                    Response::Ok { seq, session, .. } if seq == expected_seq => {
-                        assert_eq!(session, Some(expected_session));
-                        return;
+        let wait_for_input_ack =
+            |client: &mut TestClient,
+             expected_seq: u32,
+             expected_session: u32,
+             buffered_outputs: &mut Vec<(u32, String)>| {
+                for _ in 0..80 {
+                    let Some(resp) = client.recv_with_timeout(Duration::from_millis(100)) else {
+                        continue;
+                    };
+                    match resp {
+                        Response::Ok { seq, session, .. } if seq == expected_seq => {
+                            assert_eq!(session, Some(expected_session));
+                            return;
+                        }
+                        Response::Output { session, data } => {
+                            buffered_outputs
+                                .push((session, String::from_utf8_lossy(&data).to_string()));
+                        }
+                        _ => {}
                     }
-                    Response::Output { session, data } => {
-                        buffered_outputs.push((session, String::from_utf8_lossy(&data).to_string()));
-                    }
-                    _ => {}
                 }
-            }
-            panic!(
-                "timed out waiting for input ack seq={} session={}",
-                expected_seq, expected_session
-            );
-        };
+                panic!(
+                    "timed out waiting for input ack seq={} session={}",
+                    expected_seq, expected_session
+                );
+            };
         wait_for_input_ack(&mut client, input1_seq, session1, &mut buffered_outputs);
 
         let input2_seq = client.send(&Request::Input {
@@ -819,7 +848,9 @@ mod integration_tests {
             resp => panic!("Create failed: {:?}", resp),
         };
 
-        owner.send(&Request::Attach { session: session_id });
+        owner.send(&Request::Attach {
+            session: session_id,
+        });
         match owner.recv() {
             Response::Ok {
                 session: Some(attached),
@@ -830,7 +861,9 @@ mod integration_tests {
 
         let mut other = daemon.client();
         other.authenticate();
-        other.send(&Request::Attach { session: session_id });
+        other.send(&Request::Attach {
+            session: session_id,
+        });
 
         match other.recv() {
             Response::Error { code, .. } => assert_eq!(code, "ALREADY_ATTACHED"),
@@ -862,6 +895,229 @@ mod integration_tests {
         match client.recv() {
             Response::Ok { session, .. } => assert_eq!(session, Some(session_id)),
             resp => panic!("Expected input ack, got {:?}", resp),
+        }
+    }
+
+    #[test]
+    fn test_dual_channel_routes_control_and_stream_separately() {
+        let daemon = TestDaemon::start();
+
+        let mut control = daemon.client();
+        control.authenticate_with_channel(Some("client-dual"), Some(ConnectionRole::Control));
+
+        let mut stream = daemon.client();
+        stream.authenticate_with_channel(Some("client-dual"), Some(ConnectionRole::Stream));
+
+        control.send(&Request::Create {
+            cwd: None,
+            cols: Some(80),
+            rows: Some(24),
+            initial_commands: None,
+        });
+        let session_id = match control.recv() {
+            Response::Ok { session, .. } => session.expect("session id"),
+            resp => panic!("Create failed: {:?}", resp),
+        };
+
+        control.send(&Request::Attach {
+            session: session_id,
+        });
+        match control.recv() {
+            Response::Ok { session, .. } => assert_eq!(session, Some(session_id)),
+            resp => panic!("Expected control attach to route to stream, got {:?}", resp),
+        }
+
+        let input_seq = control.send(&Request::Input {
+            session: session_id,
+            data: b"printf '__DUAL_CHANNEL__\\n'\n".to_vec(),
+        });
+
+        match control.recv() {
+            Response::Ok { seq, .. } => assert_eq!(seq, input_seq),
+            resp => panic!("Expected control input ack, got {:?}", resp),
+        }
+
+        match control.recv_with_timeout(Duration::from_millis(200)) {
+            Some(Response::Output { .. }) => {
+                panic!("control channel should not receive output events")
+            }
+            _ => {}
+        }
+
+        let mut saw_marker = false;
+        for _ in 0..60 {
+            match stream.recv_with_timeout(Duration::from_millis(200)) {
+                Some(Response::Output { data, .. }) => {
+                    if String::from_utf8_lossy(&data).contains("__DUAL_CHANNEL__") {
+                        saw_marker = true;
+                        break;
+                    }
+                }
+                Some(_) => {}
+                None => {}
+            }
+        }
+
+        assert!(saw_marker, "stream channel should receive session output");
+    }
+
+    #[test]
+    fn test_control_attach_requires_stream_channel_when_explicit() {
+        let daemon = TestDaemon::start();
+
+        let mut control = daemon.client();
+        control.authenticate_with_channel(
+            Some("client-without-stream"),
+            Some(ConnectionRole::Control),
+        );
+
+        control.send(&Request::Create {
+            cwd: None,
+            cols: Some(80),
+            rows: Some(24),
+            initial_commands: None,
+        });
+        let session_id = match control.recv() {
+            Response::Ok { session, .. } => session.expect("session id"),
+            resp => panic!("Create failed: {:?}", resp),
+        };
+
+        control.send(&Request::Attach {
+            session: session_id,
+        });
+
+        match control.recv() {
+            Response::Error { code, .. } => assert_eq!(code, "STREAM_NOT_CONNECTED"),
+            resp => panic!("Expected STREAM_NOT_CONNECTED, got {:?}", resp),
+        }
+    }
+
+    #[test]
+    fn test_control_attach_recovers_after_stream_reconnect() {
+        let daemon = TestDaemon::start();
+
+        let mut control = daemon.client();
+        control.authenticate_with_channel(Some("client-recover"), Some(ConnectionRole::Control));
+
+        let mut stream = daemon.client();
+        stream.authenticate_with_channel(Some("client-recover"), Some(ConnectionRole::Stream));
+
+        control.send(&Request::Create {
+            cwd: None,
+            cols: Some(80),
+            rows: Some(24),
+            initial_commands: None,
+        });
+        let session_id = match control.recv() {
+            Response::Ok { session, .. } => session.expect("session id"),
+            resp => panic!("Create failed: {:?}", resp),
+        };
+
+        drop(stream);
+        thread::sleep(Duration::from_millis(100));
+
+        control.send(&Request::Attach {
+            session: session_id,
+        });
+        match control.recv() {
+            Response::Error { code, .. } => assert_eq!(code, "STREAM_NOT_CONNECTED"),
+            resp => panic!("Expected STREAM_NOT_CONNECTED, got {:?}", resp),
+        }
+
+        let mut stream_reconnected = daemon.client();
+        stream_reconnected
+            .authenticate_with_channel(Some("client-recover"), Some(ConnectionRole::Stream));
+
+        control.send(&Request::Attach {
+            session: session_id,
+        });
+        match control.recv() {
+            Response::Ok {
+                session: Some(attached),
+                ..
+            } => assert_eq!(attached, session_id),
+            resp => panic!(
+                "Expected attach success after stream reconnect, got {:?}",
+                resp
+            ),
+        }
+
+        control.send(&Request::Input {
+            session: session_id,
+            data: b"printf '__STREAM_RECONNECT__\\n'\n".to_vec(),
+        });
+        match control.recv() {
+            Response::Ok { session, .. } => assert_eq!(session, Some(session_id)),
+            resp => panic!("Expected input ack, got {:?}", resp),
+        }
+
+        let mut saw_marker = false;
+        for _ in 0..60 {
+            match stream_reconnected.recv_with_timeout(Duration::from_millis(200)) {
+                Some(Response::Output { data, .. }) => {
+                    if String::from_utf8_lossy(&data).contains("__STREAM_RECONNECT__") {
+                        saw_marker = true;
+                        break;
+                    }
+                }
+                Some(_) => {}
+                None => {}
+            }
+        }
+
+        assert!(
+            saw_marker,
+            "reconnected stream should receive routed output events"
+        );
+    }
+
+    #[test]
+    fn test_stream_channel_rejects_control_requests() {
+        let daemon = TestDaemon::start();
+        let mut stream = daemon.client();
+        stream.authenticate_with_channel(Some("client-stream-only"), Some(ConnectionRole::Stream));
+
+        stream.send(&Request::Create {
+            cwd: None,
+            cols: Some(80),
+            rows: Some(24),
+            initial_commands: None,
+        });
+
+        match stream.recv() {
+            Response::Error { code, .. } => assert_eq!(code, "WRONG_CHANNEL"),
+            resp => panic!("Expected WRONG_CHANNEL for stream create, got {:?}", resp),
+        }
+    }
+
+    #[test]
+    fn test_input_backpressure_respects_queue_limit() {
+        let daemon = TestDaemon::start_with_env(&[("RUST_PTY_INPUT_QUEUE_MAX_BYTES", "256")]);
+        let mut client = daemon.client();
+        client.authenticate();
+
+        client.send(&Request::Create {
+            cwd: None,
+            cols: Some(80),
+            rows: Some(24),
+            initial_commands: None,
+        });
+        let session_id = match client.recv() {
+            Response::Ok { session, .. } => session.expect("session id"),
+            resp => panic!("Create failed: {:?}", resp),
+        };
+
+        client.send(&Request::Input {
+            session: session_id,
+            data: vec![b'a'; 512],
+        });
+
+        match client.recv() {
+            Response::Error { code, .. } => assert_eq!(code, "LIMIT_REACHED"),
+            resp => panic!(
+                "Expected LIMIT_REACHED for oversized input queue, got {:?}",
+                resp
+            ),
         }
     }
 

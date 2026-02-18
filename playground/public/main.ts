@@ -2,6 +2,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
+import { decode, encode } from "@msgpack/msgpack";
 
 // ============== Types ==============
 
@@ -12,6 +13,7 @@ interface Session {
   webglAddon?: WebglAddon;
   container: HTMLDivElement;
   tabEl: HTMLDivElement;
+  lastSeq: number;
 }
 
 interface Snapshot {
@@ -30,8 +32,11 @@ interface ServerMessage {
   session?: number;
   sessions?: Array<{ id: number; pid: number; pts: string }>;
   snapshot?: Snapshot;
-  history?: string;
-  data?: string;
+  history?: Uint8Array;
+  seq?: number;
+  reset?: boolean;
+  ts?: number;
+  data?: Uint8Array;
   code?: number;
   message?: string;
 }
@@ -41,6 +46,8 @@ interface ServerMessage {
 let ws: WebSocket | null = null;
 const sessions = new Map<number, Session>();
 let activeSession: number | null = null;
+const pendingAcks = new Map<number, number>();
+let ackFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
 const STORAGE_KEYS = {
   sessions: "vibest-pty-daemon:session-ids",
@@ -146,6 +153,7 @@ function debounce<T extends (...args: any[]) => void>(fn: T, delay: number): T {
 function connect() {
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
   ws = new WebSocket(`${protocol}//${location.host}/ws`);
+  ws.binaryType = "arraybuffer";
 
   ws.onopen = () => {
     setStatus("Connected");
@@ -160,9 +168,13 @@ function connect() {
     setStatus("Connection error");
   };
 
-  ws.onmessage = (event) => {
-    const msg: ServerMessage = JSON.parse(event.data);
-    handleMessage(msg);
+  ws.onmessage = async (event) => {
+    try {
+      const msg = await decodeServerMessage(event.data);
+      handleMessage(msg);
+    } catch (error) {
+      console.error("Invalid server message:", error);
+    }
   };
 }
 
@@ -171,7 +183,46 @@ function send(msg: object) {
     console.error("[ui] WebSocket not connected, readyState:", ws?.readyState);
     return;
   }
-  ws.send(JSON.stringify(msg));
+  ws.send(encode(msg));
+}
+
+async function decodeServerMessage(data: string | ArrayBuffer | Blob): Promise<ServerMessage> {
+  if (typeof data === "string") {
+    throw new Error("text frame is not supported; expected binary MessagePack frame");
+  }
+  if (data instanceof ArrayBuffer) {
+    return decode(new Uint8Array(data)) as ServerMessage;
+  }
+
+  return decode(new Uint8Array(await data.arrayBuffer())) as ServerMessage;
+}
+
+function scheduleAckFlush(): void {
+  if (ackFlushTimer) {
+    return;
+  }
+
+  ackFlushTimer = setTimeout(() => {
+    ackFlushTimer = null;
+
+    for (const [sessionId, seq] of pendingAcks) {
+      send({ type: "ack", session: sessionId, seq });
+    }
+    pendingAcks.clear();
+  }, 40);
+}
+
+function queueAck(sessionId: number, seq: number): void {
+  if (!Number.isFinite(seq)) {
+    return;
+  }
+
+  const normalized = Math.max(0, Math.floor(seq));
+  const existing = pendingAcks.get(sessionId);
+  if (existing === undefined || normalized > existing) {
+    pendingAcks.set(sessionId, normalized);
+  }
+  scheduleAckFlush();
 }
 
 // ============== Message Handlers ==============
@@ -208,9 +259,13 @@ function handleMessage(msg: ServerMessage) {
         }
 
         for (const id of targetIds) {
-          if (!sessions.has(id)) {
+          let session = sessions.get(id);
+          if (!session) {
             createSessionUI(id);
-            send({ type: "attach", session: id });
+            session = sessions.get(id);
+          }
+          if (session) {
+            send({ type: "attach", session: id, lastSeq: session.lastSeq });
           }
         }
 
@@ -225,7 +280,7 @@ function handleMessage(msg: ServerMessage) {
         addStoredSessionId(msg.session);
         setStoredActiveSession(msg.session);
         createSessionUI(msg.session);
-        send({ type: "attach", session: msg.session });
+        send({ type: "attach", session: msg.session, lastSeq: 0 });
         switchToSession(msg.session);
       }
       break;
@@ -234,9 +289,12 @@ function handleMessage(msg: ServerMessage) {
       if (msg.session !== undefined) {
         const session = sessions.get(msg.session);
         if (session) {
+          if (msg.reset) {
+            session.terminal.reset();
+          }
+
           if (msg.history) {
-            const historyBytes = Uint8Array.from(atob(msg.history), (c) => c.charCodeAt(0));
-            session.terminal.write(historyBytes);
+            session.terminal.write(msg.history);
           } else if (msg.snapshot) {
             const { rehydrate, content } = msg.snapshot;
             if (rehydrate) {
@@ -245,6 +303,12 @@ function handleMessage(msg: ServerMessage) {
               session.terminal.write(content);
             }
           }
+
+          if (typeof msg.seq === "number" && Number.isFinite(msg.seq)) {
+            session.lastSeq = Math.max(0, Math.floor(msg.seq));
+            queueAck(msg.session, session.lastSeq);
+          }
+
           // Send initial resize
           sendResize(msg.session, session);
         }
@@ -255,11 +319,19 @@ function handleMessage(msg: ServerMessage) {
       if (msg.session !== undefined && msg.data) {
         const session = sessions.get(msg.session);
         if (session) {
-          // Decode base64 to Uint8Array, then write directly
-          const binary = Uint8Array.from(atob(msg.data), c => c.charCodeAt(0));
-          session.terminal.write(binary);
+          session.terminal.write(msg.data);
+          if (typeof msg.seq === "number" && Number.isFinite(msg.seq)) {
+            session.lastSeq = Math.max(0, Math.floor(msg.seq));
+          } else {
+            session.lastSeq += msg.data.length;
+          }
+          queueAck(msg.session, session.lastSeq);
         }
       }
+      break;
+
+    case "ping":
+      send({ type: "pong", ts: msg.ts });
       break;
 
     case "exit":
@@ -337,11 +409,10 @@ function createSessionUI(id: number) {
   terminal.onData((data) => {
     const encoder = new TextEncoder();
     const bytes = encoder.encode(data);
-    const base64 = btoa(String.fromCharCode(...bytes));
     send({
       type: "input",
       session: id,
-      data: base64,
+      data: bytes,
     });
   });
 
@@ -360,7 +431,7 @@ function createSessionUI(id: number) {
   tabsEl.appendChild(tabEl);
 
   // Store session
-  const session: Session = { id, terminal, fitAddon, webglAddon, container, tabEl };
+  const session: Session = { id, terminal, fitAddon, webglAddon, container, tabEl, lastSeq: 0 };
   sessions.set(id, session);
 
   // Handle resize with debounce

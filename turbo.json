@@ -6,7 +6,7 @@
       "outputs": ["dist/**", "public/dist/**"]
     },
     "dev": {
-      "dependsOn": ["^build"],
+      "dependsOn": ["^build", "vibest-pty-daemon#build"],
       "cache": false,
       "persistent": true
     },

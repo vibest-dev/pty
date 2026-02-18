@@ -67,7 +67,10 @@ mod tests {
 
         // Send well below threshold
         for _ in 0..100 {
-            assert!(sub.try_send(), "Should send immediately when below threshold");
+            assert!(
+                sub.try_send(),
+                "Should send immediately when below threshold"
+            );
         }
 
         assert_eq!(sub.get_pending(), 100);
