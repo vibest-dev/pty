@@ -7,8 +7,10 @@ pub struct Config {
     pub max_connections: u32,
     pub max_sessions: usize,
     pub scrollback_lines: usize,
-    pub flow_max_queue_size: usize, // Channel capacity (default 16384)
-    pub coalesce_delay_ms: u64,     // Output coalescing window (default 3ms)
+    pub session_event_queue_capacity: usize,
+    pub client_write_queue_bytes: usize,
+    pub input_queue_max_bytes: usize,
+    pub coalesce_delay_ms: u64,
 }
 
 fn default_base_dir() -> String {
@@ -43,18 +45,48 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(10000);
 
-        let flow_max_queue_size = std::env::var("RUST_PTY_FLOW_MAX_QUEUE_SIZE")
+        // Legacy compatibility knob from older builds. Keep accepted, but
+        // split queue sizing by unit (events vs bytes) in newer settings.
+        let legacy_flow_max_queue_size = std::env::var("RUST_PTY_FLOW_MAX_QUEUE_SIZE")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(16384);
+            .filter(|v: &usize| *v > 0);
+
+        let session_event_queue_capacity = std::env::var("RUST_PTY_SESSION_EVENT_QUEUE_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &usize| *v > 0)
+            .or(legacy_flow_max_queue_size)
+            .unwrap_or(1024);
+
+        let client_write_queue_bytes = std::env::var("RUST_PTY_CLIENT_MAX_WRITE_QUEUE_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &usize| *v > 0)
+            .or(legacy_flow_max_queue_size)
+            .unwrap_or(2_000_000);
+
+        let input_queue_max_bytes = std::env::var("RUST_PTY_INPUT_QUEUE_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &usize| *v > 0)
+            .unwrap_or(2_000_000);
 
         let coalesce_delay_ms = std::env::var("RUST_PTY_COALESCE_DELAY_MS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(3);
 
-        if flow_max_queue_size == 0 {
-            panic!("Invalid flow control config: max queue size must be > 0");
+        if session_event_queue_capacity == 0 {
+            panic!("Invalid config: session event queue capacity must be > 0");
+        }
+
+        if client_write_queue_bytes == 0 {
+            panic!("Invalid config: client write queue bytes must be > 0");
+        }
+
+        if input_queue_max_bytes == 0 {
+            panic!("Invalid config: input queue max bytes must be > 0");
         }
 
         Self {
@@ -64,7 +96,9 @@ impl Config {
             max_connections,
             max_sessions,
             scrollback_lines,
-            flow_max_queue_size,
+            session_event_queue_capacity,
+            client_write_queue_bytes,
+            input_queue_max_bytes,
             coalesce_delay_ms,
         }
     }

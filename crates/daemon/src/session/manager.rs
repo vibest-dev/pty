@@ -2,11 +2,33 @@ use super::{Emulator, PtyHandle};
 use crate::config::config;
 use crate::error::{Error, Result};
 use crate::protocol::{CreateOptions, SessionInfo, Snapshot};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::mpsc::TrySendError;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const INPUT_WRITE_BACKOFF_MIN_MS: u64 = 2;
+const INPUT_WRITE_BACKOFF_MAX_MS: u64 = 50;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SessionLifecycleState {
+    Alive = 0,
+    Terminating = 1,
+    Dead = 2,
+}
+
+impl SessionLifecycleState {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Alive,
+            1 => Self::Terminating,
+            _ => Self::Dead,
+        }
+    }
+}
 
 pub static MANAGER: OnceLock<Manager> = OnceLock::new();
 
@@ -46,15 +68,59 @@ pub struct Session {
     pub pty: PtyHandle,
     pub emulator: Mutex<Emulator>,
     pub running: AtomicBool,
+    pub lifecycle: AtomicU8,
     pub reader_eof: AtomicBool,
     pub exit_status: Mutex<Option<(i32, Option<i32>)>>,
+    pub input_queue: Mutex<VecDeque<Vec<u8>>>,
+    pub input_queue_bytes: AtomicUsize,
+    pub input_backoff_ms: AtomicU64,
+    pub input_backoff_until_ms: AtomicU64,
     pub created_at: SystemTime,
     pub last_attached: AtomicU64, // nanos since epoch
 }
 
 impl Session {
+    pub fn lifecycle_state(&self) -> SessionLifecycleState {
+        SessionLifecycleState::from_u8(self.lifecycle.load(Ordering::Relaxed))
+    }
+
+    pub fn mark_terminating(&self) {
+        self.lifecycle
+            .store(SessionLifecycleState::Terminating as u8, Ordering::SeqCst);
+    }
+
+    pub fn mark_dead(&self) {
+        self.lifecycle
+            .store(SessionLifecycleState::Dead as u8, Ordering::SeqCst);
+    }
+
+    pub fn try_mark_terminating(&self) -> Result<()> {
+        match self.lifecycle.compare_exchange(
+            SessionLifecycleState::Alive as u8,
+            SessionLifecycleState::Terminating as u8,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => Ok(()),
+            Err(current) => {
+                let state = SessionLifecycleState::from_u8(current);
+                match state {
+                    SessionLifecycleState::Alive => Ok(()),
+                    SessionLifecycleState::Terminating => Err(Error::Session(format!(
+                        "session {} is terminating",
+                        self.id
+                    ))),
+                    SessionLifecycleState::Dead => {
+                        Err(Error::NotFound(format!("session {}", self.id)))
+                    }
+                }
+            }
+        }
+    }
+
     pub fn is_alive(&self) -> bool {
-        self.running.load(Ordering::Relaxed)
+        self.lifecycle_state() == SessionLifecycleState::Alive
+            && self.running.load(Ordering::Relaxed)
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -90,6 +156,8 @@ pub struct Manager {
     /// The value is a bounded sender that the main loop reads from
     /// via the paired receiver stored in the client state.
     session_subscribers: RwLock<HashMap<u32, std::sync::mpsc::SyncSender<OutputEvent>>>,
+    /// Number of output events dropped per session due to subscriber backpressure.
+    dropped_event_counts: Mutex<HashMap<u32, u64>>,
     /// Channel from reader threads → main event loop.
     /// The main loop polls the receiver end to drain PTY output.
     reader_tx: std::sync::mpsc::SyncSender<ReaderEvent>,
@@ -119,6 +187,7 @@ impl Manager {
             pid_to_session: RwLock::new(HashMap::new()),
             next_id: AtomicU32::new(1),
             session_subscribers: RwLock::new(HashMap::new()),
+            dropped_event_counts: Mutex::new(HashMap::new()),
             reader_tx,
             reader_rx: Mutex::new(reader_rx),
             wakeup_write_fd: fds[1],
@@ -152,6 +221,10 @@ impl Manager {
     pub fn remove_session_subscriber(&self, session_id: u32) {
         let mut subs = self.session_subscribers.write().unwrap();
         subs.remove(&session_id);
+        self.dropped_event_counts
+            .lock()
+            .unwrap()
+            .remove(&session_id);
     }
 
     /// Create a new PTY session. Spawns a dedicated reader OS thread.
@@ -181,8 +254,13 @@ impl Manager {
             pty,
             emulator: Mutex::new(Emulator::new(cols, rows, cfg.scrollback_lines)),
             running: AtomicBool::new(true),
+            lifecycle: AtomicU8::new(SessionLifecycleState::Alive as u8),
             reader_eof: AtomicBool::new(false),
             exit_status: Mutex::new(None),
+            input_queue: Mutex::new(VecDeque::new()),
+            input_queue_bytes: AtomicUsize::new(0),
+            input_backoff_ms: AtomicU64::new(0),
+            input_backoff_until_ms: AtomicU64::new(0),
             created_at: now,
             last_attached: AtomicU64::new(now_nanos),
         });
@@ -258,6 +336,10 @@ impl Manager {
             .get(&id)
             .ok_or_else(|| Error::NotFound(format!("session {}", id)))?;
 
+        if session.lifecycle_state() != SessionLifecycleState::Alive {
+            return Err(Error::Session(format!("session {} is terminating", id)));
+        }
+
         let sig = parse_signal(signal)?;
         session.pty.send_signal(sig)?;
         Ok(())
@@ -271,6 +353,10 @@ impl Manager {
             .get(&id)
             .ok_or_else(|| Error::NotFound(format!("session {}", id)))?;
 
+        if session.lifecycle_state() != SessionLifecycleState::Alive {
+            return Err(Error::Session(format!("session {} is terminating", id)));
+        }
+
         session.pty.resize(cols, rows)?;
         session.emulator.lock().unwrap().resize(cols, rows);
         Ok(())
@@ -282,8 +368,141 @@ impl Manager {
             .get(&id)
             .ok_or_else(|| Error::NotFound(format!("session {}", id)))?;
 
+        if session.lifecycle_state() != SessionLifecycleState::Alive {
+            return Err(Error::Session(format!("session {} is terminating", id)));
+        }
+
         session.emulator.lock().unwrap().clear_scrollback();
         Ok(())
+    }
+
+    pub fn enqueue_input(&self, id: u32, data: Vec<u8>) -> Result<()> {
+        let session = self
+            .sessions
+            .read()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| Error::NotFound(format!("session {}", id)))?;
+
+        if session.lifecycle_state() != SessionLifecycleState::Alive {
+            return Err(Error::Session(format!("session {} is terminating", id)));
+        }
+
+        let limit = config().input_queue_max_bytes;
+        let incoming = data.len();
+        let current = session.input_queue_bytes.load(Ordering::Relaxed);
+        let next = current.saturating_add(incoming);
+        if next > limit {
+            return Err(Error::LimitReached(format!(
+                "input queue limit exceeded for session {} ({} > {})",
+                id, next, limit
+            )));
+        }
+
+        let mut queue = session.input_queue.lock().unwrap();
+        queue.push_back(data);
+        session
+            .input_queue_bytes
+            .store(queue.iter().map(Vec::len).sum(), Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    pub fn flush_input_queues(&self) {
+        let now_ms = epoch_millis();
+        let sessions: Vec<Arc<Session>> = self.sessions.read().unwrap().values().cloned().collect();
+
+        for session in sessions {
+            if session.lifecycle_state() != SessionLifecycleState::Alive {
+                continue;
+            }
+
+            let retry_at = session.input_backoff_until_ms.load(Ordering::Relaxed);
+            if retry_at > now_ms {
+                continue;
+            }
+
+            self.flush_session_input(&session, now_ms);
+        }
+    }
+
+    fn flush_session_input(&self, session: &Arc<Session>, now_ms: u64) {
+        loop {
+            if session.lifecycle_state() != SessionLifecycleState::Alive {
+                return;
+            }
+
+            let mut queue = session.input_queue.lock().unwrap();
+            let Some(front) = queue.front_mut() else {
+                session.input_queue_bytes.store(0, Ordering::Relaxed);
+                session.input_backoff_ms.store(0, Ordering::Relaxed);
+                session.input_backoff_until_ms.store(0, Ordering::Relaxed);
+                return;
+            };
+
+            match session.pty.write(front) {
+                Ok(0) => {
+                    let backoff = next_backoff_ms(&session);
+                    session
+                        .input_backoff_until_ms
+                        .store(now_ms.saturating_add(backoff), Ordering::Relaxed);
+                    return;
+                }
+                Ok(written) => {
+                    if written >= front.len() {
+                        let consumed = front.len();
+                        queue.pop_front();
+                        let remaining = session
+                            .input_queue_bytes
+                            .load(Ordering::Relaxed)
+                            .saturating_sub(consumed);
+                        session
+                            .input_queue_bytes
+                            .store(remaining, Ordering::Relaxed);
+                    } else {
+                        front.drain(..written);
+                        let remaining = session
+                            .input_queue_bytes
+                            .load(Ordering::Relaxed)
+                            .saturating_sub(written);
+                        session
+                            .input_queue_bytes
+                            .store(remaining, Ordering::Relaxed);
+                    }
+
+                    session.input_backoff_ms.store(0, Ordering::Relaxed);
+                    session.input_backoff_until_ms.store(0, Ordering::Relaxed);
+                }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                    continue;
+                }
+                Err(err)
+                    if err.kind() == io::ErrorKind::WouldBlock
+                        || err.raw_os_error() == Some(libc::EAGAIN)
+                        || err.raw_os_error() == Some(libc::EWOULDBLOCK)
+                        || err.raw_os_error() == Some(libc::EIO)
+                        || err.raw_os_error() == Some(libc::ENXIO) =>
+                {
+                    let backoff = next_backoff_ms(&session);
+                    session
+                        .input_backoff_until_ms
+                        .store(now_ms.saturating_add(backoff), Ordering::Relaxed);
+                    return;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[manager] Failed writing queued PTY input for session {}: {}",
+                        session.id, err
+                    );
+                    queue.clear();
+                    session.input_queue_bytes.store(0, Ordering::Relaxed);
+                    session.input_backoff_ms.store(0, Ordering::Relaxed);
+                    session.input_backoff_until_ms.store(0, Ordering::Relaxed);
+                    return;
+                }
+            }
+        }
     }
 
     /// Drain all pending reader events from the channel.
@@ -365,6 +584,7 @@ impl Manager {
         for session_id in eof_sessions {
             if let Some(session) = self.get(session_id) {
                 session.running.store(false, Ordering::SeqCst);
+                session.mark_terminating();
                 session.reader_eof.store(true, Ordering::SeqCst);
                 if let Some(exit_event) = self.maybe_finalize_session(session_id) {
                     output.push(exit_event);
@@ -401,6 +621,7 @@ impl Manager {
 
             if let Some(session_id) = session_id {
                 if let Some(session) = self.get(session_id) {
+                    session.mark_terminating();
                     *session.exit_status.lock().unwrap() = Some(exit_status);
                     if let Some(exit_event) = self.maybe_finalize_session(session_id) {
                         output.push(exit_event);
@@ -414,9 +635,35 @@ impl Manager {
 
     /// Broadcast an output event to the subscriber for a session (if any).
     pub fn broadcast_event(&self, session_id: u32, event: &OutputEvent) {
-        let subs = self.session_subscribers.read().unwrap();
-        if let Some(tx) = subs.get(&session_id) {
-            let _ = tx.try_send(event.clone());
+        let tx = {
+            let subs = self.session_subscribers.read().unwrap();
+            subs.get(&session_id).cloned()
+        };
+
+        if let Some(tx) = tx {
+            match tx.try_send(event.clone()) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    let mut drops = self.dropped_event_counts.lock().unwrap();
+                    let entry = drops.entry(session_id).or_insert(0);
+                    *entry = entry.saturating_add(1);
+
+                    // Log on powers of two to avoid flooding logs under sustained pressure.
+                    if *entry == 1 || (*entry & (*entry - 1)) == 0 {
+                        eprintln!(
+                            "[manager] Session {} output backpressured; dropped {} event(s)",
+                            session_id, entry
+                        );
+                    }
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    eprintln!(
+                        "[manager] Session {} subscriber disconnected; removing subscriber",
+                        session_id
+                    );
+                    self.remove_session_subscriber(session_id);
+                }
+            }
         }
     }
 
@@ -424,9 +671,11 @@ impl Manager {
     pub fn finalize(&self, id: u32) {
         let session = self.sessions.write().unwrap().remove(&id);
         self.session_subscribers.write().unwrap().remove(&id);
+        self.dropped_event_counts.lock().unwrap().remove(&id);
 
         if let Some(sess) = session {
             sess.running.store(false, Ordering::SeqCst);
+            sess.mark_dead();
             self.pid_to_session
                 .write()
                 .unwrap()
@@ -435,6 +684,8 @@ impl Manager {
     }
 
     fn terminate_nonblocking(&self, session: Arc<Session>) -> Result<()> {
+        session.try_mark_terminating()?;
+
         if let Err(err) = session.pty.send_signal(libc::SIGKILL) {
             // Process may have already exited between lookup and kill.
             if err.raw_os_error() != Some(libc::ESRCH) {
@@ -462,6 +713,9 @@ impl Manager {
 
     fn maybe_finalize_session(&self, session_id: u32) -> Option<(u32, OutputEvent)> {
         let session = self.get(session_id)?;
+        if session.lifecycle_state() == SessionLifecycleState::Dead {
+            return None;
+        }
         if !session.reader_eof.load(Ordering::SeqCst) {
             return None;
         }
@@ -531,6 +785,24 @@ fn reader_thread(
     });
     let byte = [1u8];
     unsafe { libc::write(wakeup_fd, byte.as_ptr().cast(), 1) };
+}
+
+fn epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn next_backoff_ms(session: &Session) -> u64 {
+    let current = session.input_backoff_ms.load(Ordering::Relaxed);
+    let next = if current == 0 {
+        INPUT_WRITE_BACKOFF_MIN_MS
+    } else {
+        (current.saturating_mul(2)).min(INPUT_WRITE_BACKOFF_MAX_MS)
+    };
+    session.input_backoff_ms.store(next, Ordering::Relaxed);
+    next
 }
 
 fn parse_signal(name: &str) -> Result<i32> {

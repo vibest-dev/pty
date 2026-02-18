@@ -1,7 +1,8 @@
 use crate::auth;
 use crate::error::Error;
 use crate::protocol::{
-    encode_message, FrameReader, Request, RequestEnvelope, Response, PROTOCOL_VERSION,
+    encode_message, ConnectionRole, FrameReader, Request, RequestEnvelope, Response,
+    PROTOCOL_VERSION,
 };
 use crate::session::{manager, OutputEvent};
 use std::collections::{HashSet, VecDeque};
@@ -14,6 +15,9 @@ const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct ClientState {
     pub stream: UnixStream,
     pub authenticated: bool,
+    pub client_id: Option<String>,
+    pub role: ConnectionRole,
+    role_explicit: bool,
     pub attached_sessions: HashSet<u32>,
     /// Per-session output receivers (one per attached session).
     pub session_receivers: Vec<(u32, std::sync::mpsc::Receiver<OutputEvent>)>,
@@ -43,18 +47,25 @@ impl ClientState {
         Ok(Self {
             stream,
             authenticated: false,
+            client_id: None,
+            role: ConnectionRole::Control,
+            role_explicit: false,
             attached_sessions: HashSet::new(),
             session_receivers: Vec::new(),
             frame_reader: FrameReader::new(),
             write_queue: VecDeque::new(),
             write_offset: 0,
             write_queue_bytes: 0,
-            max_write_queue_bytes: crate::config::config().flow_max_queue_size,
+            max_write_queue_bytes: crate::config::config().client_write_queue_bytes,
             pending_response: None,
             drain_start_index: 0,
             needs_write: false,
             dead: false,
         })
+    }
+
+    pub fn uses_explicit_role(&self) -> bool {
+        self.role_explicit
     }
 
     fn queue_response_inner(&mut self, response: &Response, max_bytes: Option<usize>) -> bool {
@@ -88,9 +99,8 @@ impl ClientState {
         let _ = self.queue_response_inner(response, None);
     }
 
-    /// Called when the socket is readable. Reads data, decodes frames,
-    /// and processes requests. Queues responses internally.
-    pub fn handle_readable(&mut self) {
+    /// Called when the socket is readable. Reads data into the frame buffer.
+    pub fn read_from_stream(&mut self) {
         let mut buf = [0u8; 65536];
         match self.stream.read(&mut buf) {
             Ok(0) => {
@@ -109,22 +119,25 @@ impl ClientState {
                 return;
             }
         }
+    }
 
-        // Decode and process all complete frames.
+    /// Decode and drain all complete request envelopes currently buffered.
+    pub fn drain_requests(&mut self) -> Vec<RequestEnvelope> {
+        let mut requests = Vec::new();
         loop {
             match self.frame_reader.try_decode::<RequestEnvelope>() {
                 Ok(Some(envelope)) => {
-                    if let Some(response) = handle_request(self, envelope.seq, envelope.request) {
-                        self.queue_response(&response);
-                    }
+                    requests.push(envelope);
                 }
                 Ok(None) => break,
                 Err(_) => {
                     self.dead = true;
-                    return;
+                    break;
                 }
             }
         }
+
+        requests
     }
 
     /// Called when the socket is writable. Flushes the write queue.
@@ -255,13 +268,15 @@ fn output_event_to_response(session_id: u32, event: OutputEvent) -> Response {
     }
 }
 
-fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Option<Response> {
+pub(crate) fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Option<Response> {
     // Require authentication first
     if !state.authenticated {
         return match req {
             Request::Handshake {
                 token,
                 protocol_version,
+                client_id,
+                role,
             } => {
                 if protocol_version != PROTOCOL_VERSION {
                     return Some(Response::error(
@@ -278,7 +293,18 @@ fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Option<Res
                     return Some(Response::error(seq, "AUTH_FAILED", "Invalid token"));
                 }
 
+                if role.is_some() && client_id.is_none() {
+                    return Some(Response::error(
+                        seq,
+                        "INVALID_HANDSHAKE",
+                        "client_id is required when role is provided",
+                    ));
+                }
+
                 state.authenticated = true;
+                state.role_explicit = role.is_some();
+                state.role = role.unwrap_or(ConnectionRole::Control);
+                state.client_id = client_id;
 
                 Some(Response::Handshake {
                     seq,
@@ -296,6 +322,17 @@ fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Option<Res
     }
 
     let mgr = manager();
+
+    if state.role_explicit
+        && state.role == ConnectionRole::Stream
+        && !matches!(req, Request::Attach { .. } | Request::Detach { .. })
+    {
+        return Some(Response::error(
+            seq,
+            "WRONG_CHANNEL",
+            "request must use control channel",
+        ));
+    }
 
     match req {
         Request::Handshake { .. } => Some(Response::error(
@@ -320,9 +357,17 @@ fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Option<Res
                 ));
             };
 
+            if !sess.is_alive() {
+                return Some(Response::error(
+                    seq,
+                    "SESSION_TERMINATING",
+                    format!("Session {} is terminating", session),
+                ));
+            }
+
             if state.attached_sessions.insert(session) {
                 let (tx, rx) = std::sync::mpsc::sync_channel::<OutputEvent>(
-                    crate::config::config().flow_max_queue_size,
+                    crate::config::config().session_event_queue_capacity,
                 );
                 match mgr.add_session_subscriber(session, tx) {
                     Ok(_) => {
@@ -353,6 +398,9 @@ fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Option<Res
 
         Request::Kill { session } => match mgr.kill(session) {
             Ok(_) => Some(Response::ok_session(seq, session)),
+            Err(Error::Session(msg)) if msg.contains("terminating") => {
+                Some(Response::error(seq, "SESSION_TERMINATING", msg))
+            }
             Err(e) => Some(Response::error(seq, e.code(), e.to_string())),
         },
 
@@ -361,20 +409,13 @@ fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Option<Res
             Some(Response::ok_count(seq, count))
         }
 
-        Request::Input { session, data } => match mgr.get(session) {
-            Some(sess) => match sess.pty.write(&data) {
-                Ok(_) => Some(Response::ok_session(seq, session)),
-                Err(e) => Some(Response::error(
-                    seq,
-                    "PTY_WRITE_FAILED",
-                    format!("Failed to write to PTY: {}", e),
-                )),
-            },
-            None => Some(Response::error(
-                seq,
-                "NOT_FOUND",
-                format!("Session {} not found", session),
-            )),
+        Request::Input { session, data } => match mgr.enqueue_input(session, data) {
+            Ok(_) => Some(Response::ok_session(seq, session)),
+            Err(Error::LimitReached(msg)) => Some(Response::error(seq, "LIMIT_REACHED", msg)),
+            Err(Error::Session(msg)) if msg.contains("terminating") => {
+                Some(Response::error(seq, "SESSION_TERMINATING", msg))
+            }
+            Err(e) => Some(Response::error(seq, e.code(), e.to_string())),
         },
 
         Request::Resize {
@@ -383,11 +424,17 @@ fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Option<Res
             rows,
         } => match mgr.resize(session, cols, rows) {
             Ok(_) => Some(Response::ok_session(seq, session)),
+            Err(Error::Session(msg)) if msg.contains("terminating") => {
+                Some(Response::error(seq, "SESSION_TERMINATING", msg))
+            }
             Err(e) => Some(Response::error(seq, e.code(), e.to_string())),
         },
 
         Request::Signal { session, signal } => match mgr.signal(session, &signal) {
             Ok(_) => Some(Response::ok_session(seq, session)),
+            Err(Error::Session(msg)) if msg.contains("terminating") => {
+                Some(Response::error(seq, "SESSION_TERMINATING", msg))
+            }
             Err(Error::Session(msg)) if msg.starts_with("unknown signal") => {
                 Some(Response::error(seq, "INVALID_SIGNAL", msg))
             }
@@ -396,6 +443,9 @@ fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Option<Res
 
         Request::ClearScrollback { session } => match mgr.clear_scrollback(session) {
             Ok(_) => Some(Response::ok_session(seq, session)),
+            Err(Error::Session(msg)) if msg.contains("terminating") => {
+                Some(Response::error(seq, "SESSION_TERMINATING", msg))
+            }
             Err(e) => Some(Response::error(seq, e.code(), e.to_string())),
         },
     }
@@ -425,12 +475,11 @@ mod tests {
 
     #[test]
     fn one_session_queue_full_must_not_block_other_session() {
-        let (tx1, _rx1) =
-            std::sync::mpsc::sync_channel::<OutputEvent>(config().flow_max_queue_size);
-        let (tx2, _rx2) =
-            std::sync::mpsc::sync_channel::<OutputEvent>(config().flow_max_queue_size);
+        let queue_cap = config().session_event_queue_capacity;
+        let (tx1, _rx1) = std::sync::mpsc::sync_channel::<OutputEvent>(queue_cap);
+        let (tx2, _rx2) = std::sync::mpsc::sync_channel::<OutputEvent>(queue_cap);
 
-        for _ in 0..config().flow_max_queue_size {
+        for _ in 0..queue_cap {
             tx1.try_send(OutputEvent::Data {
                 session: 1,
                 data: b"x".to_vec(),
@@ -678,6 +727,47 @@ mod tests {
         );
 
         other.cleanup();
+        let _ = mgr.kill(session_id);
+    }
+
+    #[test]
+    fn attach_rejected_when_session_not_alive() {
+        ensure_manager_initialized();
+        let mgr = manager();
+        let session_id = mgr
+            .create(CreateOptions {
+                cwd: None,
+                env: None,
+                shell: None,
+                cols: Some(80),
+                rows: Some(24),
+                initial_commands: None,
+            })
+            .expect("create session");
+
+        let session = mgr.get(session_id).expect("session exists");
+        session
+            .running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let (s, _) = UnixStream::pair().unwrap();
+        let mut client = ClientState::new(s).unwrap();
+        client.authenticated = true;
+
+        let response = handle_request(
+            &mut client,
+            1,
+            Request::Attach {
+                session: session_id,
+            },
+        )
+        .expect("attach response");
+
+        match response {
+            Response::Error { code, .. } => assert_eq!(code, "SESSION_TERMINATING"),
+            other => panic!("expected SESSION_TERMINATING, got {:?}", other),
+        }
+
         let _ = mgr.kill(session_id);
     }
 }

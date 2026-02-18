@@ -47,7 +47,7 @@ impl PtyHandle {
 
     pub fn write(&self, data: &[u8]) -> io::Result<usize> {
         let fd = unsafe { BorrowedFd::borrow_raw(self.master_fd) };
-        rustix::io::write(fd, data).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+        rustix::io::write(fd, data).map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {

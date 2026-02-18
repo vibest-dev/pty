@@ -7,7 +7,8 @@ mod session;
 
 use config::config;
 use polling::{Event, Events, Poller};
-use server::ClientState;
+use protocol::{ConnectionRole, Request, RequestEnvelope, Response};
+use server::{handle_request, ClientState};
 use session::manager::{Manager, MANAGER};
 use std::collections::HashMap;
 use std::fs;
@@ -318,11 +319,25 @@ fn main() {
                 key if key >= KEY_CLIENT_BASE => {
                     let client_id = key - KEY_CLIENT_BASE;
 
-                    if let Some(client) = clients.get_mut(&client_id) {
-                        if event.readable {
-                            client.handle_readable();
+                    let mut requests = Vec::new();
+                    if event.readable {
+                        if let Some(client) = clients.get_mut(&client_id) {
+                            client.read_from_stream();
+                            requests = client.drain_requests();
                         }
-                        if event.writable {
+                    }
+
+                    for envelope in requests {
+                        if let Some(response) = dispatch_request(&mut clients, client_id, envelope)
+                        {
+                            if let Some(source) = clients.get_mut(&client_id) {
+                                source.queue_response(&response);
+                            }
+                        }
+                    }
+
+                    if event.writable {
+                        if let Some(client) = clients.get_mut(&client_id) {
                             client.handle_writable();
                         }
                     }
@@ -331,6 +346,9 @@ fn main() {
                 _ => {}
             }
         }
+
+        // Flush queued PTY input writes with backoff-aware retries.
+        mgr.flush_input_queues();
 
         // Drain PTY reader events and process them (coalescing).
         let reader_events = mgr.drain_reader_events(wakeup_read_fd);
@@ -419,4 +437,55 @@ fn cleanup() {
     let _ = fs::remove_file(&cfg.socket_path);
     let _ = fs::remove_file(&cfg.pid_path);
     auth::cleanup();
+}
+
+fn dispatch_request(
+    clients: &mut HashMap<usize, ClientState>,
+    source_client_id: usize,
+    envelope: RequestEnvelope,
+) -> Option<Response> {
+    let route_to_stream = {
+        let source = clients.get(&source_client_id)?;
+        source.authenticated
+            && source.uses_explicit_role()
+            && source.role == ConnectionRole::Control
+            && matches!(
+                &envelope.request,
+                Request::Attach { .. } | Request::Detach { .. }
+            )
+    };
+
+    if route_to_stream {
+        let client_id = clients
+            .get(&source_client_id)
+            .and_then(|c| c.client_id.clone())
+            .unwrap_or_default();
+
+        let stream_client_id = clients
+            .iter()
+            .find(|(id, c)| {
+                **id != source_client_id
+                    && !c.dead
+                    && c.authenticated
+                    && c.role == ConnectionRole::Stream
+                    && c.client_id.as_deref() == Some(client_id.as_str())
+            })
+            .map(|(id, _)| *id);
+
+        let Some(stream_client_id) = stream_client_id else {
+            return Some(Response::error(
+                envelope.seq,
+                "STREAM_NOT_CONNECTED",
+                "No paired stream channel connected",
+            ));
+        };
+
+        let mut stream_client = clients.remove(&stream_client_id)?;
+        let response = handle_request(&mut stream_client, envelope.seq, envelope.request);
+        clients.insert(stream_client_id, stream_client);
+        return response;
+    }
+
+    let source = clients.get_mut(&source_client_id)?;
+    handle_request(source, envelope.seq, envelope.request)
 }
