@@ -3,10 +3,9 @@ use crate::config::config;
 use crate::error::{Error, Result};
 use crate::protocol::{CreateOptions, SessionInfo, Snapshot};
 use crate::session::journal::JournalStore;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::mpsc::TrySendError;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 

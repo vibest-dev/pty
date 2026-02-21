@@ -62,6 +62,8 @@ enum Request {
         protocol_version: u32,
         client_id: String,
         role: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        channel_mode: Option<String>,
     },
     Create {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -186,10 +188,21 @@ struct TestDaemon {
 
 impl TestDaemon {
     fn start() -> Self {
+        Self::start_with_env(&[])
+    }
+
+    fn start_with_env(extra: &[(&str, &str)]) -> Self {
         let (socket_path, token_path, journal_path) = get_test_paths();
 
         cleanup_paths(&socket_path, &token_path, &journal_path);
-        let child = spawn_daemon(&socket_path, &token_path, &journal_path);
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_vibest-pty-daemon"));
+        cmd.env("RUST_PTY_SOCKET_PATH", &socket_path)
+            .env("RUST_PTY_TOKEN_PATH", &token_path)
+            .env("RUST_PTY_JOURNAL_PATH", &journal_path);
+        for &(k, v) in extra {
+            cmd.env(k, v);
+        }
+        let child = cmd.spawn().expect("Failed to start daemon");
         wait_for_socket(&socket_path);
 
         Self {
@@ -330,11 +343,24 @@ impl TestClient {
             .trim()
             .to_string();
 
+        let effective_client_id = client_id.unwrap_or(self.client_id.as_str()).to_string();
+        let is_dual_channel = role.is_some();
+        let effective_role = match role.unwrap_or(ConnectionRole::Control) {
+            ConnectionRole::Control => "control",
+            ConnectionRole::Stream => "stream",
+        };
+        let channel_mode = if is_dual_channel {
+            Some("dual".to_string())
+        } else {
+            None
+        };
+
         self.send(&Request::Handshake {
             token,
             protocol_version: PROTOCOL_VERSION,
-            client_id: self.client_id.clone(),
-            role: "control".into(),
+            client_id: effective_client_id,
+            role: effective_role.into(),
+            channel_mode,
         });
 
         match self.recv() {
@@ -413,6 +439,7 @@ mod integration_tests {
             protocol_version: PROTOCOL_VERSION,
             client_id: "test-client-auth".into(),
             role: "control".into(),
+            channel_mode: None,
         });
 
         match client.recv() {
@@ -440,6 +467,7 @@ mod integration_tests {
             protocol_version: PROTOCOL_VERSION,
             client_id: "test-client-invalid-token".into(),
             role: "control".into(),
+            channel_mode: None,
         });
 
         match client.recv() {
@@ -464,6 +492,7 @@ mod integration_tests {
             protocol_version: 999,
             client_id: "test-client-proto-mismatch".into(),
             role: "control".into(),
+            channel_mode: None,
         });
 
         match client.recv() {
@@ -488,6 +517,7 @@ mod integration_tests {
             protocol_version: PROTOCOL_VERSION,
             client_id: "test-client-stream-role".into(),
             role: "stream".into(),
+            channel_mode: None,
         });
 
         match client.recv() {
@@ -523,6 +553,7 @@ mod integration_tests {
             protocol_version: PROTOCOL_VERSION,
             client_id: "test-client-stream-read-only".into(),
             role: "stream".into(),
+            channel_mode: None,
         });
 
         match client.recv() {

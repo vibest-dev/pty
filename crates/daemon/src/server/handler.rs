@@ -1,7 +1,8 @@
 use crate::auth;
 use crate::error::Error;
 use crate::protocol::{
-    encode_message, ClientRole, FrameReader, Request, RequestEnvelope, Response, PROTOCOL_VERSION,
+    encode_message, ChannelMode, ConnectionRole, FrameReader, Request, RequestEnvelope, Response,
+    PROTOCOL_VERSION,
 };
 use crate::session::{manager, OutputEvent};
 use std::collections::{HashMap, VecDeque};
@@ -15,7 +16,8 @@ pub struct ClientState {
     pub stream: UnixStream,
     pub authenticated: bool,
     pub client_id: Option<String>,
-    pub role: Option<ClientRole>,
+    pub role: ConnectionRole,
+    pub role_explicit: bool,
     pub attached_sessions: HashMap<u32, u64>,
     /// Per-session output receivers (one per attached session).
     pub session_receivers: Vec<(u32, std::sync::mpsc::Receiver<OutputEvent>)>,
@@ -46,7 +48,8 @@ impl ClientState {
             stream,
             authenticated: false,
             client_id: None,
-            role: None,
+            role: ConnectionRole::Control,
+            role_explicit: false,
             attached_sessions: HashMap::new(),
             session_receivers: Vec::new(),
             frame_reader: FrameReader::new(),
@@ -294,7 +297,7 @@ fn request_requires_owner(req: &Request) -> Option<u32> {
     }
 }
 
-fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Option<Response> {
+pub(crate) fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Option<Response> {
     // Require authentication first
     if !state.authenticated {
         return match req {
@@ -303,6 +306,7 @@ fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Option<Res
                 protocol_version,
                 client_id,
                 role,
+                channel_mode,
             } => {
                 if protocol_version != PROTOCOL_VERSION {
                     return Some(Response::error(
@@ -329,7 +333,8 @@ fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Option<Res
 
                 state.authenticated = true;
                 state.client_id = Some(client_id);
-                state.role = Some(role);
+                state.role = role;
+                state.role_explicit = matches!(channel_mode, Some(ChannelMode::Dual));
 
                 Some(Response::Handshake {
                     seq,
@@ -346,11 +351,19 @@ fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Option<Res
         };
     }
 
-    if matches!(state.role, Some(ClientRole::Stream)) && request_requires_control(&req) {
+    if state.role == ConnectionRole::Stream && request_requires_control(&req) {
         return Some(Response::error(
             seq,
-            "ROLE_FORBIDDEN",
-            "This operation requires control role; stream role is read-only",
+            if state.role_explicit {
+                "WRONG_CHANNEL"
+            } else {
+                "ROLE_FORBIDDEN"
+            },
+            if state.role_explicit {
+                "request must use control channel"
+            } else {
+                "This operation requires control role; stream role is read-only"
+            },
         ));
     }
 
@@ -367,17 +380,6 @@ fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Option<Res
     }
 
     let mgr = manager();
-
-    if state.role_explicit
-        && state.role == ConnectionRole::Stream
-        && !matches!(req, Request::Attach { .. } | Request::Detach { .. })
-    {
-        return Some(Response::error(
-            seq,
-            "WRONG_CHANNEL",
-            "request must use control channel",
-        ));
-    }
 
     match req {
         Request::Handshake { .. } => Some(Response::error(
@@ -424,6 +426,14 @@ fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Option<Res
                 ));
             };
 
+            if !sess.is_alive() {
+                return Some(Response::error(
+                    seq,
+                    "SESSION_TERMINATING",
+                    format!("Session {} is terminating", session),
+                ));
+            }
+
             if !state.attached_sessions.contains_key(&session) {
                 let (tx, rx) = std::sync::mpsc::sync_channel::<OutputEvent>(
                     crate::config::config().session_event_queue_capacity,
@@ -433,7 +443,7 @@ fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Option<Res
                         state.attached_sessions.insert(session, subscriber_id);
                         state.session_receivers.push((session, rx));
 
-                        if matches!(state.role, Some(ClientRole::Control)) {
+                        if state.role == ConnectionRole::Control {
                             if let Some(client_id) = state.client_id.as_deref() {
                                 mgr.ensure_owner(session, client_id);
                             }

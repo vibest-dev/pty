@@ -10,6 +10,15 @@ pub enum ClientRole {
     Stream,
 }
 
+pub use ClientRole as ConnectionRole;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelMode {
+    Single,
+    Dual,
+}
+
 /// Client -> Server messages
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -19,6 +28,8 @@ pub enum Request {
         protocol_version: u32,
         client_id: String,
         role: ClientRole,
+        #[serde(default)]
+        channel_mode: Option<ChannelMode>,
     },
     Create {
         #[serde(flatten)]
