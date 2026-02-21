@@ -4,6 +4,7 @@ pub struct Config {
     pub socket_path: String,
     pub token_path: String,
     pub pid_path: String,
+    pub journal_path: String,
     pub max_connections: u32,
     pub max_sessions: usize,
     pub scrollback_lines: usize,
@@ -29,6 +30,9 @@ impl Config {
             std::env::var("RUST_PTY_TOKEN_PATH").unwrap_or_else(|_| format!("{}/token", base_dir));
 
         let pid_path = format!("{}.pid", socket_path.trim_end_matches(".sock"));
+
+        let journal_path = std::env::var("RUST_PTY_JOURNAL_PATH")
+            .unwrap_or_else(|_| format!("{}/journal.msgpack", base_dir));
 
         let max_connections = std::env::var("RUST_PTY_MAX_CONNECTIONS")
             .ok()
@@ -93,6 +97,7 @@ impl Config {
             socket_path,
             token_path,
             pid_path,
+            journal_path,
             max_connections,
             max_sessions,
             scrollback_lines,

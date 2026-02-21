@@ -91,9 +91,18 @@ type ClientOptions = {
   token?: string; // direct handshake token
   tokenPath?: string; // default: $HOME/.vibest/pty/token
   protocolVersion?: number; // default: 1
+  clientId?: string; // default: generated UUID
+  role?: "control" | "stream"; // default: "control"
   requestTimeoutMs?: number;
 };
 ```
+
+## Breaking v1 Handshake Contract
+
+- Handshake now requires `client_id` and `role` in addition to token and protocol version.
+- Older clients that do not send these fields fail handshake decoding and are disconnected.
+- `role: "stream"` is read-only and cannot run mutating operations.
+- Mutating session operations require ownership; non-owner clients receive `OWNER_REQUIRED`.
 
 `session.create({ shell })` is optional; daemon defaults to `$SHELL` (fallback `/bin/sh`).
 

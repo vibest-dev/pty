@@ -1,11 +1,10 @@
 use crate::auth;
 use crate::error::Error;
 use crate::protocol::{
-    encode_message, ConnectionRole, FrameReader, Request, RequestEnvelope, Response,
-    PROTOCOL_VERSION,
+    encode_message, ClientRole, FrameReader, Request, RequestEnvelope, Response, PROTOCOL_VERSION,
 };
 use crate::session::{manager, OutputEvent};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 
@@ -16,9 +15,8 @@ pub struct ClientState {
     pub stream: UnixStream,
     pub authenticated: bool,
     pub client_id: Option<String>,
-    pub role: ConnectionRole,
-    role_explicit: bool,
-    pub attached_sessions: HashSet<u32>,
+    pub role: Option<ClientRole>,
+    pub attached_sessions: HashMap<u32, u64>,
     /// Per-session output receivers (one per attached session).
     pub session_receivers: Vec<(u32, std::sync::mpsc::Receiver<OutputEvent>)>,
     /// Frame reader for accumulating incoming data.
@@ -48,9 +46,8 @@ impl ClientState {
             stream,
             authenticated: false,
             client_id: None,
-            role: ConnectionRole::Control,
-            role_explicit: false,
-            attached_sessions: HashSet::new(),
+            role: None,
+            attached_sessions: HashMap::new(),
             session_receivers: Vec::new(),
             frame_reader: FrameReader::new(),
             write_queue: VecDeque::new(),
@@ -247,8 +244,12 @@ impl ClientState {
     /// Clean up on disconnect: remove all session subscriptions.
     pub fn cleanup(&mut self) {
         let mgr = manager();
-        for session_id in self.attached_sessions.drain() {
-            mgr.remove_session_subscriber(session_id);
+        let client_id = self.client_id.clone();
+        for (session_id, subscriber_id) in self.attached_sessions.drain() {
+            mgr.remove_session_subscriber(session_id, subscriber_id);
+            if let Some(client_id) = client_id.as_deref() {
+                mgr.release_owner_if_matches(session_id, client_id);
+            }
         }
         self.session_receivers.clear();
     }
@@ -268,7 +269,31 @@ fn output_event_to_response(session_id: u32, event: OutputEvent) -> Response {
     }
 }
 
-pub(crate) fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Option<Response> {
+fn request_requires_control(req: &Request) -> bool {
+    matches!(
+        req,
+        Request::Create { .. }
+            | Request::Kill { .. }
+            | Request::KillAll
+            | Request::Input { .. }
+            | Request::Resize { .. }
+            | Request::Signal { .. }
+            | Request::ClearScrollback { .. }
+    )
+}
+
+fn request_requires_owner(req: &Request) -> Option<u32> {
+    match req {
+        Request::Kill { session }
+        | Request::Input { session, .. }
+        | Request::Resize { session, .. }
+        | Request::Signal { session, .. }
+        | Request::ClearScrollback { session } => Some(*session),
+        _ => None,
+    }
+}
+
+fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Option<Response> {
     // Require authentication first
     if !state.authenticated {
         return match req {
@@ -293,18 +318,17 @@ pub(crate) fn handle_request(state: &mut ClientState, seq: u32, req: Request) ->
                     return Some(Response::error(seq, "AUTH_FAILED", "Invalid token"));
                 }
 
-                if role.is_some() && client_id.is_none() {
+                if client_id.trim().is_empty() {
                     return Some(Response::error(
                         seq,
-                        "INVALID_HANDSHAKE",
-                        "client_id is required when role is provided",
+                        "INVALID_CLIENT_ID",
+                        "client_id must be non-empty",
                     ));
                 }
 
                 state.authenticated = true;
-                state.role_explicit = role.is_some();
-                state.role = role.unwrap_or(ConnectionRole::Control);
-                state.client_id = client_id;
+                state.client_id = Some(client_id);
+                state.role = Some(role);
 
                 Some(Response::Handshake {
                     seq,
@@ -319,6 +343,26 @@ pub(crate) fn handle_request(state: &mut ClientState, seq: u32, req: Request) ->
                 "Send Handshake first",
             )),
         };
+    }
+
+    if matches!(state.role, Some(ClientRole::Stream)) && request_requires_control(&req) {
+        return Some(Response::error(
+            seq,
+            "ROLE_FORBIDDEN",
+            "This operation requires control role; stream role is read-only",
+        ));
+    }
+
+    if let Some(session_id) = request_requires_owner(&req) {
+        let client_id = state.client_id.as_deref().unwrap_or_default();
+        if !client_id.is_empty() && !manager().claim_owner_if_unset_or_match(session_id, client_id)
+        {
+            return Some(Response::error(
+                seq,
+                "OWNER_REQUIRED",
+                format!("client is not owner of session {}", session_id),
+            ));
+        }
     }
 
     let mgr = manager();
@@ -342,7 +386,12 @@ pub(crate) fn handle_request(state: &mut ClientState, seq: u32, req: Request) ->
         )),
 
         Request::Create { options } => match mgr.create(options) {
-            Ok(id) => Some(Response::ok_session(seq, id)),
+            Ok(id) => {
+                if let Some(client_id) = state.client_id.as_deref() {
+                    mgr.ensure_owner(id, client_id);
+                }
+                Some(Response::ok_session(seq, id))
+            }
             Err(e) => Some(Response::error(seq, e.code(), e.to_string())),
         },
 
@@ -357,28 +406,22 @@ pub(crate) fn handle_request(state: &mut ClientState, seq: u32, req: Request) ->
                 ));
             };
 
-            if !sess.is_alive() {
-                return Some(Response::error(
-                    seq,
-                    "SESSION_TERMINATING",
-                    format!("Session {} is terminating", session),
-                ));
-            }
-
-            if state.attached_sessions.insert(session) {
+            if !state.attached_sessions.contains_key(&session) {
                 let (tx, rx) = std::sync::mpsc::sync_channel::<OutputEvent>(
                     crate::config::config().session_event_queue_capacity,
                 );
                 match mgr.add_session_subscriber(session, tx) {
-                    Ok(_) => {
+                    Ok(subscriber_id) => {
+                        state.attached_sessions.insert(session, subscriber_id);
                         state.session_receivers.push((session, rx));
-                    }
-                    Err(Error::Session(msg)) if msg.contains("already attached") => {
-                        state.attached_sessions.remove(&session);
-                        return Some(Response::error(seq, "ALREADY_ATTACHED", msg));
+
+                        if matches!(state.role, Some(ClientRole::Control)) {
+                            if let Some(client_id) = state.client_id.as_deref() {
+                                mgr.ensure_owner(session, client_id);
+                            }
+                        }
                     }
                     Err(e) => {
-                        state.attached_sessions.remove(&session);
                         return Some(Response::error(seq, e.code(), e.to_string()));
                     }
                 }
@@ -389,9 +432,12 @@ pub(crate) fn handle_request(state: &mut ClientState, seq: u32, req: Request) ->
         }
 
         Request::Detach { session } => {
-            if state.attached_sessions.remove(&session) {
-                mgr.remove_session_subscriber(session);
+            if let Some(subscriber_id) = state.attached_sessions.remove(&session) {
+                mgr.remove_session_subscriber(session, subscriber_id);
                 state.session_receivers.retain(|(id, _)| *id != session);
+                if let Some(client_id) = state.client_id.as_deref() {
+                    mgr.release_owner_if_matches(session, client_id);
+                }
             }
             Some(Response::ok_session(seq, session))
         }
@@ -623,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn second_client_cannot_attach_same_session() {
+    fn second_client_can_attach_same_session_as_observer() {
         ensure_manager_initialized();
         let mgr = manager();
         let session_id = mgr
@@ -666,10 +712,10 @@ mod tests {
             },
         )
         .expect("other attach response");
-        match other_attach {
-            Response::Error { code, .. } => assert_eq!(code, "ALREADY_ATTACHED"),
-            resp => panic!("expected ALREADY_ATTACHED, got {:?}", resp),
-        }
+        assert!(
+            matches!(other_attach, Response::Ok { .. }),
+            "observer attach should succeed"
+        );
 
         owner.cleanup();
         other.cleanup();

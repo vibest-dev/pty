@@ -14,12 +14,14 @@ use serde::{Deserialize, Serialize};
 
 // Unique counter for test isolation
 static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+static CLIENT_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-fn get_test_paths() -> (String, String) {
+fn get_test_paths() -> (String, String, String) {
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let socket = format!("/tmp/rust-pty-test-{}.sock", id);
     let token = format!("/tmp/rust-pty-test-{}.token", id);
-    (socket, token)
+    let journal = format!("/tmp/rust-pty-test-{}.journal.msgpack", id);
+    (socket, token, journal)
 }
 
 const PROTOCOL_VERSION: u32 = 1;
@@ -32,10 +34,8 @@ enum Request {
     Handshake {
         token: String,
         protocol_version: u32,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        client_id: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        role: Option<ConnectionRole>,
+        client_id: String,
+        role: String,
     },
     Create {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -134,28 +134,24 @@ struct TestDaemon {
     child: Child,
     socket_path: String,
     token_path: String,
+    journal_path: String,
 }
 
 impl TestDaemon {
     fn start() -> Self {
-        Self::start_with_env(&[])
-    }
-
-    fn start_with_env(extra: &[(&str, &str)]) -> Self {
-        let (socket_path, token_path) = get_test_paths();
+        let (socket_path, token_path, journal_path) = get_test_paths();
 
         // Cleanup
         let _ = fs::remove_file(&socket_path);
         let _ = fs::remove_file(&token_path);
+        let _ = fs::remove_file(&journal_path);
 
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_vibest-pty-daemon"));
-        cmd.env("RUST_PTY_SOCKET_PATH", &socket_path)
-            .env("RUST_PTY_TOKEN_PATH", &token_path);
-        for &(k, v) in extra {
-            cmd.env(k, v);
-        }
-
-        let child = cmd.spawn().expect("Failed to start daemon");
+        let child = Command::new(env!("CARGO_BIN_EXE_vibest-pty-daemon"))
+            .env("RUST_PTY_SOCKET_PATH", &socket_path)
+            .env("RUST_PTY_TOKEN_PATH", &token_path)
+            .env("RUST_PTY_JOURNAL_PATH", &journal_path)
+            .spawn()
+            .expect("Failed to start daemon");
 
         // Wait for socket
         for _ in 0..50 {
@@ -171,6 +167,7 @@ impl TestDaemon {
             child,
             socket_path,
             token_path,
+            journal_path,
         }
     }
 
@@ -185,6 +182,7 @@ impl Drop for TestDaemon {
         let _ = self.child.wait();
         let _ = fs::remove_file(&self.socket_path);
         let _ = fs::remove_file(&self.token_path);
+        let _ = fs::remove_file(&self.journal_path);
         let _ = fs::remove_file(format!(
             "{}.pid",
             self.socket_path.trim_end_matches(".sock")
@@ -196,6 +194,7 @@ struct TestClient {
     stream: UnixStream,
     token_path: String,
     next_seq: u32,
+    client_id: String,
 }
 
 impl TestClient {
@@ -210,6 +209,11 @@ impl TestClient {
             stream,
             token_path: token_path.to_string(),
             next_seq: 1,
+            client_id: format!(
+                "itest-client-{}-{}",
+                std::process::id(),
+                CLIENT_COUNTER.fetch_add(1, Ordering::SeqCst)
+            ),
         }
     }
 
@@ -306,8 +310,8 @@ impl TestClient {
         self.send(&Request::Handshake {
             token,
             protocol_version: PROTOCOL_VERSION,
-            client_id: client_id.map(str::to_string),
-            role,
+            client_id: self.client_id.clone(),
+            role: "control".into(),
         });
 
         match self.recv() {
@@ -383,8 +387,8 @@ mod integration_tests {
         client.send(&Request::Handshake {
             token,
             protocol_version: PROTOCOL_VERSION,
-            client_id: None,
-            role: None,
+            client_id: "test-client-auth".into(),
+            role: "control".into(),
         });
 
         match client.recv() {
@@ -410,8 +414,8 @@ mod integration_tests {
         client.send(&Request::Handshake {
             token: "invalid_token".into(),
             protocol_version: PROTOCOL_VERSION,
-            client_id: None,
-            role: None,
+            client_id: "test-client-invalid-token".into(),
+            role: "control".into(),
         });
 
         match client.recv() {
@@ -434,8 +438,8 @@ mod integration_tests {
         client.send(&Request::Handshake {
             token,
             protocol_version: 999,
-            client_id: None,
-            role: None,
+            client_id: "test-client-proto-mismatch".into(),
+            role: "control".into(),
         });
 
         match client.recv() {
@@ -443,6 +447,69 @@ mod integration_tests {
                 assert_eq!(code, "PROTOCOL_MISMATCH");
             }
             resp => panic!("Expected Error, got {:?}", resp),
+        }
+    }
+
+    #[test]
+    fn test_stream_role_cannot_run_control_ops() {
+        let daemon = TestDaemon::start();
+        let mut client = daemon.client();
+
+        let token = fs::read_to_string(&daemon.token_path)
+            .unwrap()
+            .trim()
+            .to_string();
+        client.send(&Request::Handshake {
+            token,
+            protocol_version: PROTOCOL_VERSION,
+            client_id: "test-client-stream-role".into(),
+            role: "stream".into(),
+        });
+
+        match client.recv() {
+            Response::Handshake { .. } => {}
+            resp => panic!("Expected Handshake, got {:?}", resp),
+        }
+
+        client.send(&Request::Create {
+            cwd: None,
+            cols: Some(80),
+            rows: Some(24),
+            initial_commands: None,
+        });
+        match client.recv() {
+            Response::Error { code, .. } => {
+                assert_eq!(code, "ROLE_FORBIDDEN");
+            }
+            resp => panic!("Expected Error, got {:?}", resp),
+        }
+    }
+
+    #[test]
+    fn test_stream_role_can_run_read_only_list() {
+        let daemon = TestDaemon::start();
+        let mut client = daemon.client();
+
+        let token = fs::read_to_string(&daemon.token_path)
+            .unwrap()
+            .trim()
+            .to_string();
+        client.send(&Request::Handshake {
+            token,
+            protocol_version: PROTOCOL_VERSION,
+            client_id: "test-client-stream-read-only".into(),
+            role: "stream".into(),
+        });
+
+        match client.recv() {
+            Response::Handshake { .. } => {}
+            resp => panic!("Expected Handshake, got {:?}", resp),
+        }
+
+        client.send(&Request::List);
+        match client.recv() {
+            Response::Ok { .. } => {}
+            resp => panic!("Expected Ok list response, got {:?}", resp),
         }
     }
 
@@ -831,7 +898,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn test_session_cannot_be_attached_by_multiple_clients() {
+    fn test_session_can_be_attached_by_multiple_clients() {
         let daemon = TestDaemon::start();
 
         let mut owner = daemon.client();
@@ -866,8 +933,50 @@ mod integration_tests {
         });
 
         match other.recv() {
-            Response::Error { code, .. } => assert_eq!(code, "ALREADY_ATTACHED"),
-            resp => panic!("Expected ALREADY_ATTACHED error, got {:?}", resp),
+            Response::Ok {
+                session: Some(attached),
+                ..
+            } => assert_eq!(attached, session_id),
+            resp => panic!("Expected second attach success, got {:?}", resp),
+        }
+    }
+
+    #[test]
+    fn test_only_owner_can_write_to_session() {
+        let daemon = TestDaemon::start();
+
+        let mut owner = daemon.client();
+        owner.authenticate();
+
+        owner.send(&Request::Create {
+            cwd: None,
+            cols: Some(80),
+            rows: Some(24),
+            initial_commands: None,
+        });
+        let session_id = match owner.recv() {
+            Response::Ok { session, .. } => session.expect("session id"),
+            resp => panic!("Create failed: {:?}", resp),
+        };
+
+        let mut other = daemon.client();
+        other.authenticate();
+        other.send(&Request::Attach {
+            session: session_id,
+        });
+        match other.recv() {
+            Response::Ok { .. } => {}
+            resp => panic!("Attach failed: {:?}", resp),
+        }
+
+        other.send(&Request::Input {
+            session: session_id,
+            data: b"echo not-owner\n".to_vec(),
+        });
+
+        match other.recv() {
+            Response::Error { code, .. } => assert_eq!(code, "OWNER_REQUIRED"),
+            resp => panic!("Expected OWNER_REQUIRED, got {:?}", resp),
         }
     }
 

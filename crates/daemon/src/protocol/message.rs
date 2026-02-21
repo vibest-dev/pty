@@ -3,17 +3,11 @@ use std::collections::HashMap;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum ConnectionRole {
+pub enum ClientRole {
     Control,
     Stream,
-}
-
-impl Default for ConnectionRole {
-    fn default() -> Self {
-        Self::Control
-    }
 }
 
 /// Client -> Server messages
@@ -23,10 +17,8 @@ pub enum Request {
     Handshake {
         token: String,
         protocol_version: u32,
-        #[serde(default)]
-        client_id: Option<String>,
-        #[serde(default)]
-        role: Option<ConnectionRole>,
+        client_id: String,
+        role: ClientRole,
     },
     Create {
         #[serde(flatten)]

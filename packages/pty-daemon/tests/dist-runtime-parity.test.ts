@@ -13,6 +13,7 @@ type RequestMessage = {
 };
 
 const sockets: string[] = [];
+let socketCounter = 0;
 
 afterEach(() => {
   for (const socketPath of sockets.splice(0)) {
@@ -25,7 +26,7 @@ afterEach(() => {
 });
 
 function nextSocketPath(): string {
-  const name = `pty-daemon-dist-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`;
+  const name = `pd-${process.pid}-${Date.now().toString(36)}-${(socketCounter++).toString(36)}.sock`;
   const socketPath = path.join(os.tmpdir(), name);
   sockets.push(socketPath);
   return socketPath;

@@ -1,4 +1,5 @@
 mod emulator;
+mod journal;
 pub mod manager;
 mod pty;
 

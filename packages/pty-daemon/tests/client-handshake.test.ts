@@ -12,6 +12,8 @@ type HandshakeRequest = {
   seq: number;
   token: string;
   protocol_version: number;
+  client_id: string;
+  role: "control" | "stream";
 };
 
 function isHandshakeRequest(value: unknown): value is HandshakeRequest {
@@ -23,7 +25,9 @@ function isHandshakeRequest(value: unknown): value is HandshakeRequest {
     candidate.type === "handshake" &&
     typeof candidate.seq === "number" &&
     typeof candidate.token === "string" &&
-    typeof candidate.protocol_version === "number"
+    typeof candidate.protocol_version === "number" &&
+    typeof candidate.client_id === "string" &&
+    (candidate.role === "control" || candidate.role === "stream")
   );
 }
 
@@ -64,6 +68,8 @@ describe("PtyDaemonClient handshake", () => {
         expect(handshake.seq).toBe(1);
         expect(handshake.token).toBe("token-1");
         expect(handshake.protocol_version).toBe(1);
+        expect(handshake.client_id.length).toBeGreaterThan(0);
+        expect(handshake.role).toBe("control");
 
         socket.write(
           Buffer.from(

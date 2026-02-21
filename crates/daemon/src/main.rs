@@ -119,6 +119,7 @@ fn main() {
         eprintln!("[daemon] Failed to set MANAGER (already initialized)");
         return;
     }
+    session::manager::manager().reconcile_journal();
 
     // Create the poller.
     let poller = match Poller::new() {

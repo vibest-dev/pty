@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import net from "node:net";
 import { DEFAULT_SOCKET_PATH, DEFAULT_TOKEN_PATH } from "./daemon";
 import { FrameParser, FrameParserError, encodeFrame } from "./frame";
@@ -63,6 +64,8 @@ export type HandshakeRequest = {
   type: "handshake";
   token: string;
   protocol_version: number;
+  client_id: string;
+  role: "control" | "stream";
 };
 
 export type CreateRequest = { type: "create" } & CreateOptions;
@@ -241,6 +244,8 @@ export type ClientOptions = {
   token?: string;
   tokenPath?: string;
   protocolVersion?: number;
+  clientId?: string;
+  role?: "control" | "stream";
   requestTimeoutMs?: number;
 };
 
@@ -252,6 +257,8 @@ export class PtyDaemonClient extends EventEmitter<PtyDaemonClientEvents> {
   private token?: string;
   private readonly tokenPath: string;
   private readonly protocolVersion: number;
+  private readonly clientId: string;
+  private readonly role: "control" | "stream";
   private readonly requestTimeoutMs?: number;
   private pendingHandshakeSeq: Seq | null = null;
   private handshakeResponse: HandshakeResponse | null = null;
@@ -272,6 +279,8 @@ export class PtyDaemonClient extends EventEmitter<PtyDaemonClientEvents> {
     this.token = options.token;
     this.tokenPath = options.tokenPath ?? DEFAULT_TOKEN_PATH;
     this.protocolVersion = options.protocolVersion ?? 1;
+    this.clientId = options.clientId ?? randomUUID();
+    this.role = options.role ?? "control";
     this.requestTimeoutMs = options.requestTimeoutMs;
   }
 
@@ -337,7 +346,13 @@ export class PtyDaemonClient extends EventEmitter<PtyDaemonClientEvents> {
     const token = this.token ?? (await this.readTokenFromFile());
     this.token = token;
     const reply = await this.requestRaw(
-      { type: "handshake", token, protocol_version: this.protocolVersion },
+      {
+        type: "handshake",
+        token,
+        protocol_version: this.protocolVersion,
+        client_id: this.clientId,
+        role: this.role,
+      },
       options,
     );
     if (reply.type === "error") throw new DaemonError(reply.code, reply.message);

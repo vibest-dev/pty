@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 // ============== Shared protocol types (mirror daemon's protocol) ==============
 
 const PROTOCOL_VERSION: u32 = 1;
+static CLIENT_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -22,6 +23,8 @@ enum Request {
     Handshake {
         token: String,
         protocol_version: u32,
+        client_id: String,
+        role: String,
     },
     Create {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -113,18 +116,20 @@ struct SessionInfo {
 
 static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-fn get_test_paths() -> (String, String) {
+fn get_test_paths() -> (String, String, String) {
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let pid = std::process::id();
     let socket = format!("/tmp/rust-pty-sync-test-{}-{}.sock", pid, id);
     let token = format!("/tmp/rust-pty-sync-test-{}-{}.token", pid, id);
-    (socket, token)
+    let journal = format!("/tmp/rust-pty-sync-test-{}-{}.journal.msgpack", pid, id);
+    (socket, token, journal)
 }
 
 struct TestDaemon {
     child: Child,
     socket_path: String,
     token_path: String,
+    journal_path: String,
 }
 
 impl TestDaemon {
@@ -133,13 +138,15 @@ impl TestDaemon {
     }
 
     fn start_with_env(extra: &[(&str, &str)]) -> Self {
-        let (socket_path, token_path) = get_test_paths();
+        let (socket_path, token_path, journal_path) = get_test_paths();
         let _ = fs::remove_file(&socket_path);
         let _ = fs::remove_file(&token_path);
+        let _ = fs::remove_file(&journal_path);
 
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_vibest-pty-daemon"));
         cmd.env("RUST_PTY_SOCKET_PATH", &socket_path)
-            .env("RUST_PTY_TOKEN_PATH", &token_path);
+            .env("RUST_PTY_TOKEN_PATH", &token_path)
+            .env("RUST_PTY_JOURNAL_PATH", &journal_path);
 
         for &(k, v) in extra {
             cmd.env(k, v);
@@ -159,6 +166,7 @@ impl TestDaemon {
             child,
             socket_path,
             token_path,
+            journal_path,
         }
     }
 
@@ -173,6 +181,7 @@ impl Drop for TestDaemon {
         let _ = self.child.wait();
         let _ = fs::remove_file(&self.socket_path);
         let _ = fs::remove_file(&self.token_path);
+        let _ = fs::remove_file(&self.journal_path);
         let _ = fs::remove_file(format!(
             "{}.pid",
             self.socket_path.trim_end_matches(".sock")
@@ -184,6 +193,7 @@ struct TestClient {
     stream: UnixStream,
     token_path: String,
     next_seq: u32,
+    client_id: String,
 }
 
 impl TestClient {
@@ -197,6 +207,11 @@ impl TestClient {
             stream,
             token_path: token_path.to_string(),
             next_seq: 1,
+            client_id: format!(
+                "sync-client-{}-{}",
+                std::process::id(),
+                CLIENT_COUNTER.fetch_add(1, Ordering::SeqCst)
+            ),
         }
     }
 
@@ -270,6 +285,8 @@ impl TestClient {
         self.send(&Request::Handshake {
             token,
             protocol_version: PROTOCOL_VERSION,
+            client_id: self.client_id.clone(),
+            role: "control".into(),
         });
         match self.recv() {
             Response::Handshake { .. } => {}
@@ -617,10 +634,10 @@ mod sync_integration_tests {
             resp => panic!("Attach failed: {:?}", resp),
         }
 
-        // Generate a burst: `seq 1 5000` outputs many lines quickly.
+        // Generate a burst using standard Unix tools.
         client.send(&Request::Input {
             session: sid,
-            data: b"seq 1 5000\n".to_vec(),
+            data: b"yes 1234567890 | head -n 5000\n".to_vec(),
         });
         match client.recv_ok() {
             Response::Ok { .. } => {}
@@ -630,14 +647,17 @@ mod sync_integration_tests {
         // Drain output for a few seconds — we don't need to verify every line,
         // just that the daemon stays alive and produces output.
         let mut total_bytes = 0usize;
-        for _ in 0..200 {
+        let mut consecutive_timeouts = 0u32;
+        for _ in 0..120 {
             match client.recv_with_timeout(Duration::from_millis(200)) {
                 Some(Response::Output { data, .. }) => {
                     total_bytes += data.len();
+                    consecutive_timeouts = 0;
                 }
                 Some(_) => {}
                 None => {
-                    if total_bytes > 0 {
+                    consecutive_timeouts += 1;
+                    if total_bytes > 1000 && consecutive_timeouts >= 5 {
                         break; // output finished
                     }
                 }
@@ -832,7 +852,7 @@ mod sync_integration_tests {
 
             client.send(&Request::Input {
                 session: sid,
-                data: b"seq 1 200\n".to_vec(),
+                data: b"yes 1234567890 | head -n 200\n".to_vec(),
             });
             let _ = client.recv_ok(); // input ok
 

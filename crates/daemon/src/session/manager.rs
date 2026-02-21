@@ -2,7 +2,8 @@ use super::{Emulator, PtyHandle};
 use crate::config::config;
 use crate::error::{Error, Result};
 use crate::protocol::{CreateOptions, SessionInfo, Snapshot};
-use std::collections::{HashMap, VecDeque};
+use crate::session::journal::JournalStore;
+use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::TrySendError;
@@ -77,6 +78,8 @@ pub struct Session {
     pub input_backoff_until_ms: AtomicU64,
     pub created_at: SystemTime,
     pub last_attached: AtomicU64, // nanos since epoch
+    pub cwd: String,
+    pub shell: Option<String>,
 }
 
 impl Session {
@@ -152,12 +155,13 @@ pub struct Manager {
     sessions: RwLock<HashMap<u32, Arc<Session>>>,
     pid_to_session: RwLock<HashMap<i32, u32>>,
     next_id: AtomicU32,
-    /// One subscriber per session (single-client attachment model).
-    /// The value is a bounded sender that the main loop reads from
-    /// via the paired receiver stored in the client state.
-    session_subscribers: RwLock<HashMap<u32, std::sync::mpsc::SyncSender<OutputEvent>>>,
-    /// Number of output events dropped per session due to subscriber backpressure.
-    dropped_event_counts: Mutex<HashMap<u32, u64>>,
+    /// Session subscribers keyed by session -> subscriber id -> sender.
+    /// Supports one owner and multiple observers per session.
+    session_subscribers:
+        RwLock<HashMap<u32, HashMap<u64, std::sync::mpsc::SyncSender<OutputEvent>>>>,
+    /// Session owner map: session -> client_id.
+    session_owners: RwLock<HashMap<u32, String>>,
+    next_subscriber_id: AtomicU64,
     /// Channel from reader threads → main event loop.
     /// The main loop polls the receiver end to drain PTY output.
     reader_tx: std::sync::mpsc::SyncSender<ReaderEvent>,
@@ -165,6 +169,7 @@ pub struct Manager {
     /// Pipe used by reader threads to wake up the main polling loop.
     /// The reader writes a byte here after sending on the channel.
     wakeup_write_fd: i32,
+    journal: Option<JournalStore>,
 }
 
 impl Manager {
@@ -187,10 +192,17 @@ impl Manager {
             pid_to_session: RwLock::new(HashMap::new()),
             next_id: AtomicU32::new(1),
             session_subscribers: RwLock::new(HashMap::new()),
-            dropped_event_counts: Mutex::new(HashMap::new()),
+            session_owners: RwLock::new(HashMap::new()),
+            next_subscriber_id: AtomicU64::new(1),
             reader_tx,
             reader_rx: Mutex::new(reader_rx),
             wakeup_write_fd: fds[1],
+            journal: JournalStore::open(config().journal_path.clone())
+                .map_err(|e| {
+                    eprintln!("[journal] failed to open journal store: {}", e);
+                    e
+                })
+                .ok(),
         };
 
         (mgr, fds[0])
@@ -201,30 +213,68 @@ impl Manager {
         &self,
         session_id: u32,
         tx: std::sync::mpsc::SyncSender<OutputEvent>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         if !self.sessions.read().unwrap().contains_key(&session_id) {
             return Err(Error::NotFound(format!("session {}", session_id)));
         }
 
+        let subscriber_id = self.next_subscriber_id.fetch_add(1, Ordering::SeqCst);
         let mut subs = self.session_subscribers.write().unwrap();
-        if subs.contains_key(&session_id) {
-            return Err(Error::Session(format!(
-                "session {} already attached",
-                session_id
-            )));
+        let session_subs = subs.entry(session_id).or_default();
+        session_subs.insert(subscriber_id, tx);
+
+        if let Some(session) = self.get(session_id) {
+            let now_nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            session.last_attached.store(now_nanos, Ordering::Relaxed);
+            if let Some(journal) = &self.journal {
+                journal.touch_attached(session_id, now_nanos / 1_000_000_000);
+            }
         }
-        subs.insert(session_id, tx);
-        Ok(())
+
+        Ok(subscriber_id)
     }
 
     /// Remove a subscriber for a specific session.
-    pub fn remove_session_subscriber(&self, session_id: u32) {
+    pub fn remove_session_subscriber(&self, session_id: u32, subscriber_id: u64) {
         let mut subs = self.session_subscribers.write().unwrap();
-        subs.remove(&session_id);
-        self.dropped_event_counts
-            .lock()
-            .unwrap()
-            .remove(&session_id);
+        if let Some(session_subs) = subs.get_mut(&session_id) {
+            session_subs.remove(&subscriber_id);
+            if session_subs.is_empty() {
+                subs.remove(&session_id);
+            }
+        }
+    }
+
+    pub fn ensure_owner(&self, session_id: u32, client_id: &str) {
+        let mut owners = self.session_owners.write().unwrap();
+        owners
+            .entry(session_id)
+            .or_insert_with(|| client_id.to_string());
+    }
+
+    pub fn claim_owner_if_unset_or_match(&self, session_id: u32, client_id: &str) -> bool {
+        let mut owners = self.session_owners.write().unwrap();
+        match owners.get(&session_id) {
+            Some(owner) => owner == client_id,
+            None => {
+                owners.insert(session_id, client_id.to_string());
+                true
+            }
+        }
+    }
+
+    pub fn release_owner_if_matches(&self, session_id: u32, client_id: &str) {
+        let mut owners = self.session_owners.write().unwrap();
+        if owners
+            .get(&session_id)
+            .map(|owner| owner == client_id)
+            .unwrap_or(false)
+        {
+            owners.remove(&session_id);
+        }
     }
 
     /// Create a new PTY session. Spawns a dedicated reader OS thread.
@@ -238,12 +288,27 @@ impl Manager {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         let cwd = opts.cwd.as_deref().unwrap_or(".");
+        let shell = opts.shell.clone();
         let cols = opts.cols.unwrap_or(80);
         let rows = opts.rows.unwrap_or(24);
         validate_terminal_size(cols, rows)?;
 
-        let pty = PtyHandle::spawn(cwd, opts.shell.as_deref(), opts.env.as_ref(), cols, rows)?;
+        self.spawn_session_with_id(id, cwd, shell.as_deref(), opts.env.as_ref(), cols, rows)?;
 
+        Ok(id)
+    }
+
+    fn spawn_session_with_id(
+        &self,
+        id: u32,
+        cwd: &str,
+        shell: Option<&str>,
+        env: Option<&HashMap<String, String>>,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Arc<Session>> {
+        let cfg = config();
+        let pty = PtyHandle::spawn(cwd, shell, env, cols, rows)?;
         let master_fd = pty.master_fd;
 
         let now = SystemTime::now();
@@ -263,6 +328,8 @@ impl Manager {
             input_backoff_until_ms: AtomicU64::new(0),
             created_at: now,
             last_attached: AtomicU64::new(now_nanos),
+            cwd: cwd.to_string(),
+            shell: shell.map(|s| s.to_string()),
         });
 
         self.sessions.write().unwrap().insert(id, session.clone());
@@ -271,7 +338,24 @@ impl Manager {
             .unwrap()
             .insert(session.pty.child_pid, id);
 
-        // Spawn a dedicated OS reader thread for this session's PTY.
+        if let Some(journal) = &self.journal {
+            journal.upsert_running(
+                id,
+                session.pty.child_pid,
+                session.pty.pts_path.clone(),
+                session.cwd.clone(),
+                session.shell.clone(),
+                cols,
+                rows,
+                session
+                    .created_at
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                now_nanos / 1_000_000_000,
+            );
+        }
+
         let tx = self.reader_tx.clone();
         let wakeup_fd = self.wakeup_write_fd;
         let session_clone = session.clone();
@@ -282,7 +366,7 @@ impl Manager {
             })
             .map_err(|e| Error::Session(format!("failed to spawn reader thread: {}", e)))?;
 
-        Ok(id)
+        Ok(session)
     }
 
     pub fn get(&self, id: u32) -> Option<Arc<Session>> {
@@ -635,33 +719,26 @@ impl Manager {
 
     /// Broadcast an output event to the subscriber for a session (if any).
     pub fn broadcast_event(&self, session_id: u32, event: &OutputEvent) {
-        let tx = {
+        let mut stale = Vec::new();
+        {
             let subs = self.session_subscribers.read().unwrap();
-            subs.get(&session_id).cloned()
-        };
-
-        if let Some(tx) = tx {
-            match tx.try_send(event.clone()) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => {
-                    let mut drops = self.dropped_event_counts.lock().unwrap();
-                    let entry = drops.entry(session_id).or_insert(0);
-                    *entry = entry.saturating_add(1);
-
-                    // Log on powers of two to avoid flooding logs under sustained pressure.
-                    if *entry == 1 || (*entry & (*entry - 1)) == 0 {
-                        eprintln!(
-                            "[manager] Session {} output backpressured; dropped {} event(s)",
-                            session_id, entry
-                        );
+            if let Some(session_subs) = subs.get(&session_id) {
+                for (subscriber_id, tx) in session_subs {
+                    if tx.try_send(event.clone()).is_err() {
+                        stale.push(*subscriber_id);
                     }
                 }
-                Err(TrySendError::Disconnected(_)) => {
-                    eprintln!(
-                        "[manager] Session {} subscriber disconnected; removing subscriber",
-                        session_id
-                    );
-                    self.remove_session_subscriber(session_id);
+            }
+        }
+
+        if !stale.is_empty() {
+            let mut subs = self.session_subscribers.write().unwrap();
+            if let Some(session_subs) = subs.get_mut(&session_id) {
+                for subscriber_id in stale {
+                    session_subs.remove(&subscriber_id);
+                }
+                if session_subs.is_empty() {
+                    subs.remove(&session_id);
                 }
             }
         }
@@ -671,7 +748,7 @@ impl Manager {
     pub fn finalize(&self, id: u32) {
         let session = self.sessions.write().unwrap().remove(&id);
         self.session_subscribers.write().unwrap().remove(&id);
-        self.dropped_event_counts.lock().unwrap().remove(&id);
+        self.session_owners.write().unwrap().remove(&id);
 
         if let Some(sess) = session {
             sess.running.store(false, Ordering::SeqCst);
@@ -699,6 +776,10 @@ impl Manager {
     fn terminate_and_finalize_nonblocking(&self, id: u32, session: Arc<Session>) -> Result<()> {
         self.terminate_nonblocking(session)?;
 
+        if let Some(journal) = &self.journal {
+            journal.mark_exit(id, 128 + libc::SIGKILL, Some(libc::SIGKILL));
+        }
+
         self.broadcast_event(
             id,
             &OutputEvent::Exit {
@@ -721,6 +802,9 @@ impl Manager {
         }
 
         let (code, signal) = (*session.exit_status.lock().unwrap())?;
+        if let Some(journal) = &self.journal {
+            journal.mark_exit(session_id, code, signal);
+        }
         self.finalize(session_id);
         Some((
             session_id,
@@ -731,6 +815,92 @@ impl Manager {
             },
         ))
     }
+
+    pub fn reconcile_journal(&self) {
+        let Some(journal) = &self.journal else {
+            return;
+        };
+
+        let running = journal.running_entries();
+        if running.is_empty() {
+            return;
+        }
+
+        let mut marked_unrecoverable = 0usize;
+        let mut restored = 0usize;
+
+        for entry in running {
+            let process_alive = is_pid_alive(entry.pid);
+            if process_alive {
+                journal.mark_unrecoverable(entry.id, "live_process_recovery_not_supported");
+                marked_unrecoverable += 1;
+                continue;
+            }
+
+            if self.sessions.read().unwrap().contains_key(&entry.id) {
+                journal.mark_unrecoverable(entry.id, "session_id_conflict_on_restore");
+                marked_unrecoverable += 1;
+                continue;
+            }
+
+            match self.spawn_session_with_id(
+                entry.id,
+                &entry.cwd,
+                entry.shell.as_deref(),
+                None,
+                entry.cols,
+                entry.rows,
+            ) {
+                Ok(_) => {
+                    self.bump_next_id(entry.id);
+                    restored += 1;
+                }
+                Err(err) => {
+                    let reason = format!("cold_restore_failed:{}", err.code());
+                    journal.mark_unrecoverable(entry.id, reason);
+                    marked_unrecoverable += 1;
+                }
+            }
+        }
+
+        if restored > 0 {
+            eprintln!("[journal] reconcile restored {} sessions", restored);
+        }
+
+        if marked_unrecoverable > 0 {
+            eprintln!(
+                "[journal] reconcile marked {} sessions unrecoverable",
+                marked_unrecoverable
+            );
+        }
+    }
+
+    fn bump_next_id(&self, restored_id: u32) {
+        let mut current = self.next_id.load(Ordering::SeqCst);
+        while current <= restored_id {
+            match self.next_id.compare_exchange(
+                current,
+                restored_id + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(next) => current = next,
+            }
+        }
+    }
+}
+
+fn is_pid_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    let err = io::Error::last_os_error();
+    err.raw_os_error() != Some(libc::ESRCH)
 }
 
 /// Dedicated OS thread that reads from a PTY master fd.
