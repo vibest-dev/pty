@@ -273,6 +273,7 @@ fn request_requires_control(req: &Request) -> bool {
     matches!(
         req,
         Request::Create { .. }
+            | Request::CreateOrAttach { .. }
             | Request::Kill { .. }
             | Request::KillAll
             | Request::Input { .. }
@@ -389,6 +390,23 @@ fn handle_request(state: &mut ClientState, seq: u32, req: Request) -> Option<Res
             Ok(id) => {
                 if let Some(client_id) = state.client_id.as_deref() {
                     mgr.ensure_owner(id, client_id);
+                }
+                Some(Response::ok_session(seq, id))
+            }
+            Err(e) => Some(Response::error(seq, e.code(), e.to_string())),
+        },
+
+        Request::CreateOrAttach {
+            session_key,
+            options,
+        } => match mgr.create_or_attach(session_key, options) {
+            Ok((id, created_new)) => {
+                if let Some(client_id) = state.client_id.as_deref() {
+                    if created_new {
+                        mgr.ensure_owner(id, client_id);
+                    } else {
+                        let _ = mgr.claim_owner_if_unset_or_match(id, client_id);
+                    }
                 }
                 Some(Response::ok_session(seq, id))
             }

@@ -35,6 +35,8 @@ export function createPty(options: CreatePtyOptions = {}): PtyInstance {
   const clientOptions: ClientOptions = {
     token: options.token,
     protocolVersion: options.protocolVersion,
+    clientId: options.clientId,
+    role: options.role,
     requestTimeoutMs: options.requestTimeoutMs,
     socketPath,
     tokenPath,

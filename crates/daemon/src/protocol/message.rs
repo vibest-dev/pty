@@ -24,6 +24,11 @@ pub enum Request {
         #[serde(flatten)]
         options: CreateOptions,
     },
+    CreateOrAttach {
+        session_key: String,
+        #[serde(flatten)]
+        options: CreateOptions,
+    },
     List,
     Attach {
         session: u32,
@@ -169,6 +174,8 @@ impl Response {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_key: Option<String>,
     pub pid: i32,
     pub pts: String,
     pub is_alive: bool,

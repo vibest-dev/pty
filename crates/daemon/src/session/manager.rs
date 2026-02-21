@@ -66,6 +66,7 @@ pub enum OutputEvent {
 
 pub struct Session {
     pub id: u32,
+    pub session_key: Option<String>,
     pub pty: PtyHandle,
     pub emulator: Mutex<Emulator>,
     pub running: AtomicBool,
@@ -141,6 +142,7 @@ impl Session {
 
         SessionInfo {
             id: self.id,
+            session_key: self.session_key.clone(),
             pid: self.pty.child_pid,
             pts: self.pty.pts_path.clone(),
             is_alive: self.is_alive(),
@@ -153,6 +155,7 @@ impl Session {
 /// Central session manager. All methods are synchronous.
 pub struct Manager {
     sessions: RwLock<HashMap<u32, Arc<Session>>>,
+    key_to_session: RwLock<HashMap<String, u32>>,
     pid_to_session: RwLock<HashMap<i32, u32>>,
     next_id: AtomicU32,
     /// Session subscribers keyed by session -> subscriber id -> sender.
@@ -189,6 +192,7 @@ impl Manager {
 
         let mgr = Self {
             sessions: RwLock::new(HashMap::new()),
+            key_to_session: RwLock::new(HashMap::new()),
             pid_to_session: RwLock::new(HashMap::new()),
             next_id: AtomicU32::new(1),
             session_subscribers: RwLock::new(HashMap::new()),
@@ -293,14 +297,97 @@ impl Manager {
         let rows = opts.rows.unwrap_or(24);
         validate_terminal_size(cols, rows)?;
 
-        self.spawn_session_with_id(id, cwd, shell.as_deref(), opts.env.as_ref(), cols, rows)?;
+        self.spawn_session_with_id(
+            id,
+            None,
+            cwd,
+            shell.as_deref(),
+            opts.env.as_ref(),
+            cols,
+            rows,
+        )?;
 
         Ok(id)
+    }
+
+    /// Create a new session for `session_key` or return an existing live one.
+    pub fn create_or_attach(
+        &self,
+        session_key: String,
+        mut opts: CreateOptions,
+    ) -> Result<(u32, bool)> {
+        let session_key = normalize_session_key(&session_key)?;
+
+        if let Some(existing_id) = self.find_session_by_key(&session_key) {
+            return Ok((existing_id, false));
+        }
+
+        if let Some(journal) = &self.journal {
+            if let Some(previous) = journal.latest_entry_for_key(&session_key) {
+                if opts.cwd.is_none() {
+                    opts.cwd = Some(previous.cwd);
+                }
+                if opts.shell.is_none() {
+                    opts.shell = previous.shell;
+                }
+                if opts.cols.is_none() {
+                    opts.cols = Some(previous.cols);
+                }
+                if opts.rows.is_none() {
+                    opts.rows = Some(previous.rows);
+                }
+            }
+        }
+
+        let cfg = config();
+        if self.sessions.read().unwrap().len() >= cfg.max_sessions {
+            return Err(Error::LimitReached("max sessions reached".into()));
+        }
+
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let cwd = opts.cwd.as_deref().unwrap_or(".");
+        let shell = opts.shell.clone();
+        let cols = opts.cols.unwrap_or(80);
+        let rows = opts.rows.unwrap_or(24);
+        validate_terminal_size(cols, rows)?;
+
+        self.spawn_session_with_id(
+            id,
+            Some(&session_key),
+            cwd,
+            shell.as_deref(),
+            opts.env.as_ref(),
+            cols,
+            rows,
+        )?;
+
+        Ok((id, true))
+    }
+
+    fn find_session_by_key(&self, session_key: &str) -> Option<u32> {
+        let maybe_id = self
+            .key_to_session
+            .read()
+            .unwrap()
+            .get(session_key)
+            .copied();
+
+        let Some(id) = maybe_id else {
+            return None;
+        };
+
+        if self.sessions.read().unwrap().contains_key(&id) {
+            return Some(id);
+        }
+
+        self.key_to_session.write().unwrap().remove(session_key);
+        None
     }
 
     fn spawn_session_with_id(
         &self,
         id: u32,
+        session_key: Option<&str>,
         cwd: &str,
         shell: Option<&str>,
         env: Option<&HashMap<String, String>>,
@@ -313,9 +400,11 @@ impl Manager {
 
         let now = SystemTime::now();
         let now_nanos = now.duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+        let session_key_owned = session_key.map(|value| value.to_string());
 
         let session = Arc::new(Session {
             id,
+            session_key: session_key_owned.clone(),
             pty,
             emulator: Mutex::new(Emulator::new(cols, rows, cfg.scrollback_lines)),
             running: AtomicBool::new(true),
@@ -338,9 +427,17 @@ impl Manager {
             .unwrap()
             .insert(session.pty.child_pid, id);
 
+        if let Some(session_key) = session_key_owned.as_ref() {
+            self.key_to_session
+                .write()
+                .unwrap()
+                .insert(session_key.clone(), id);
+        }
+
         if let Some(journal) = &self.journal {
             journal.upsert_running(
                 id,
+                session_key_owned,
                 session.pty.child_pid,
                 session.pty.pts_path.clone(),
                 session.cwd.clone(),
@@ -751,6 +848,9 @@ impl Manager {
         self.session_owners.write().unwrap().remove(&id);
 
         if let Some(sess) = session {
+            if let Some(session_key) = &sess.session_key {
+                self.key_to_session.write().unwrap().remove(session_key);
+            }
             sess.running.store(false, Ordering::SeqCst);
             sess.mark_dead();
             self.pid_to_session
@@ -845,6 +945,7 @@ impl Manager {
 
             match self.spawn_session_with_id(
                 entry.id,
+                entry.session_key.as_deref(),
                 &entry.cwd,
                 entry.shell.as_deref(),
                 None,
@@ -901,6 +1002,21 @@ fn is_pid_alive(pid: i32) -> bool {
     }
     let err = io::Error::last_os_error();
     err.raw_os_error() != Some(libc::ESRCH)
+}
+
+fn normalize_session_key(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(Error::InvalidArgument(
+            "session_key must be non-empty".into(),
+        ));
+    }
+    if trimmed.len() > 256 {
+        return Err(Error::InvalidArgument(
+            "session_key must be <= 256 characters".into(),
+        ));
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Dedicated OS thread that reads from a PTY master fd.

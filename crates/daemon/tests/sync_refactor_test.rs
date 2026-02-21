@@ -36,6 +36,17 @@ enum Request {
         #[serde(skip_serializing_if = "Option::is_none")]
         initial_commands: Option<Vec<String>>,
     },
+    CreateOrAttach {
+        session_key: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cols: Option<u16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rows: Option<u16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        initial_commands: Option<Vec<String>>,
+    },
     List,
     Attach {
         session: u32,

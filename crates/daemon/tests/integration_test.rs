@@ -24,6 +24,32 @@ fn get_test_paths() -> (String, String, String) {
     (socket, token, journal)
 }
 
+fn cleanup_paths(socket_path: &str, token_path: &str, journal_path: &str) {
+    let _ = fs::remove_file(socket_path);
+    let _ = fs::remove_file(token_path);
+    let _ = fs::remove_file(journal_path);
+    let _ = fs::remove_file(format!("{}.pid", socket_path.trim_end_matches(".sock")));
+}
+
+fn wait_for_socket(socket_path: &str) {
+    for _ in 0..50 {
+        if fs::metadata(socket_path).is_ok() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    thread::sleep(Duration::from_millis(200));
+}
+
+fn spawn_daemon(socket_path: &str, token_path: &str, journal_path: &str) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_vibest-pty-daemon"))
+        .env("RUST_PTY_SOCKET_PATH", socket_path)
+        .env("RUST_PTY_TOKEN_PATH", token_path)
+        .env("RUST_PTY_JOURNAL_PATH", journal_path)
+        .spawn()
+        .expect("Failed to start daemon")
+}
+
 const PROTOCOL_VERSION: u32 = 1;
 
 // ============== Message Types ==============
@@ -38,6 +64,17 @@ enum Request {
         role: String,
     },
     Create {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cols: Option<u16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rows: Option<u16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        initial_commands: Option<Vec<String>>,
+    },
+    CreateOrAttach {
+        session_key: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -101,6 +138,8 @@ enum Response {
         seq: u32,
         session: Option<u32>,
         sessions: Option<Vec<SessionInfo>>,
+        #[serde(default)]
+        snapshot: Option<Snapshot>,
         count: Option<u32>,
     },
     Error {
@@ -122,10 +161,18 @@ enum Response {
 struct SessionInfo {
     id: u32,
     #[allow(dead_code)]
+    session_key: Option<String>,
+    #[allow(dead_code)]
     pid: i32,
     #[allow(dead_code)]
     pts: String,
     is_alive: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Snapshot {
+    cols: u16,
+    rows: u16,
 }
 
 // ============== Test Helpers ==============
@@ -141,27 +188,9 @@ impl TestDaemon {
     fn start() -> Self {
         let (socket_path, token_path, journal_path) = get_test_paths();
 
-        // Cleanup
-        let _ = fs::remove_file(&socket_path);
-        let _ = fs::remove_file(&token_path);
-        let _ = fs::remove_file(&journal_path);
-
-        let child = Command::new(env!("CARGO_BIN_EXE_vibest-pty-daemon"))
-            .env("RUST_PTY_SOCKET_PATH", &socket_path)
-            .env("RUST_PTY_TOKEN_PATH", &token_path)
-            .env("RUST_PTY_JOURNAL_PATH", &journal_path)
-            .spawn()
-            .expect("Failed to start daemon");
-
-        // Wait for socket
-        for _ in 0..50 {
-            if fs::metadata(&socket_path).is_ok() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-
-        thread::sleep(Duration::from_millis(200));
+        cleanup_paths(&socket_path, &token_path, &journal_path);
+        let child = spawn_daemon(&socket_path, &token_path, &journal_path);
+        wait_for_socket(&socket_path);
 
         Self {
             child,
@@ -180,13 +209,7 @@ impl Drop for TestDaemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = fs::remove_file(&self.socket_path);
-        let _ = fs::remove_file(&self.token_path);
-        let _ = fs::remove_file(&self.journal_path);
-        let _ = fs::remove_file(format!(
-            "{}.pid",
-            self.socket_path.trim_end_matches(".sock")
-        ));
+        cleanup_paths(&self.socket_path, &self.token_path, &self.journal_path);
     }
 }
 
@@ -356,6 +379,7 @@ mod unit_tests {
             seq: 1,
             session: Some(1),
             sessions: None,
+            snapshot: None,
             count: None,
         };
 
@@ -534,6 +558,142 @@ mod integration_tests {
             }
             resp => panic!("Expected Ok, got {:?}", resp),
         }
+    }
+
+    #[test]
+    fn test_create_or_attach_reuses_stable_session_key() {
+        let daemon = TestDaemon::start();
+
+        let mut first = daemon.client();
+        first.authenticate();
+
+        first.send(&Request::CreateOrAttach {
+            session_key: "workspace-pane-1".into(),
+            cwd: Some("/tmp".into()),
+            cols: Some(100),
+            rows: Some(30),
+            initial_commands: None,
+        });
+        let first_id = match first.recv() {
+            Response::Ok { session, .. } => session.expect("session id"),
+            resp => panic!("Expected first create_or_attach ok, got {:?}", resp),
+        };
+
+        let mut second = daemon.client();
+        second.authenticate();
+        second.send(&Request::CreateOrAttach {
+            session_key: "workspace-pane-1".into(),
+            cwd: Some("/tmp".into()),
+            cols: Some(100),
+            rows: Some(30),
+            initial_commands: None,
+        });
+        let second_id = match second.recv() {
+            Response::Ok { session, .. } => session.expect("session id"),
+            resp => panic!("Expected second create_or_attach ok, got {:?}", resp),
+        };
+
+        assert_eq!(first_id, second_id);
+
+        second.send(&Request::List);
+        match second.recv() {
+            Response::Ok {
+                sessions: Some(list),
+                ..
+            } => {
+                let found = list
+                    .into_iter()
+                    .find(|session| session.id == first_id)
+                    .expect("session must be present in list");
+                assert_eq!(found.session_key.as_deref(), Some("workspace-pane-1"));
+            }
+            resp => panic!("Expected list response, got {:?}", resp),
+        }
+    }
+
+    #[test]
+    fn test_create_or_attach_rejects_empty_session_key() {
+        let daemon = TestDaemon::start();
+        let mut client = daemon.client();
+        client.authenticate();
+
+        client.send(&Request::CreateOrAttach {
+            session_key: "   ".into(),
+            cwd: None,
+            cols: Some(80),
+            rows: Some(24),
+            initial_commands: None,
+        });
+
+        match client.recv() {
+            Response::Error { code, .. } => assert_eq!(code, "INVALID_ARGUMENT"),
+            resp => panic!("Expected invalid argument error, got {:?}", resp),
+        }
+    }
+
+    #[test]
+    fn test_create_or_attach_survives_daemon_restart_with_same_key() {
+        let (socket_path, token_path, journal_path) = get_test_paths();
+        cleanup_paths(&socket_path, &token_path, &journal_path);
+
+        let mut first_daemon = spawn_daemon(&socket_path, &token_path, &journal_path);
+        wait_for_socket(&socket_path);
+
+        let first_id = {
+            let mut first_client = TestClient::connect(&socket_path, &token_path);
+            first_client.authenticate();
+            first_client.send(&Request::CreateOrAttach {
+                session_key: "restart-pane-1".into(),
+                cwd: Some("/tmp".into()),
+                cols: Some(88),
+                rows: Some(26),
+                initial_commands: None,
+            });
+
+            match first_client.recv() {
+                Response::Ok { session, .. } => session.expect("first session id"),
+                resp => panic!("Expected create_or_attach ok, got {:?}", resp),
+            }
+        };
+
+        let _ = first_daemon.kill();
+        let _ = first_daemon.wait();
+
+        let mut second_daemon = spawn_daemon(&socket_path, &token_path, &journal_path);
+        wait_for_socket(&socket_path);
+
+        let mut second_client = TestClient::connect(&socket_path, &token_path);
+        second_client.authenticate();
+        second_client.send(&Request::CreateOrAttach {
+            session_key: "restart-pane-1".into(),
+            cwd: None,
+            cols: None,
+            rows: None,
+            initial_commands: None,
+        });
+
+        let second_id = match second_client.recv() {
+            Response::Ok { session, .. } => session.expect("second session id"),
+            resp => panic!("Expected create_or_attach ok after restart, got {:?}", resp),
+        };
+
+        second_client.send(&Request::Attach { session: second_id });
+        match second_client.recv() {
+            Response::Ok {
+                snapshot: Some(snapshot),
+                ..
+            } => {
+                assert_eq!(snapshot.cols, 88);
+                assert_eq!(snapshot.rows, 26);
+            }
+            resp => panic!("Expected attach snapshot after restart, got {:?}", resp),
+        }
+
+        assert_eq!(first_id, second_id);
+
+        let _ = second_daemon.kill();
+        let _ = second_daemon.wait();
+        cleanup_paths(&socket_path, &token_path, &journal_path);
     }
 
     #[test]

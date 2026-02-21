@@ -34,6 +34,7 @@ export type Snapshot = {
 
 export type SessionInfo = {
   id: number;
+  session_key?: string;
   pid: number;
   pts: string;
   is_alive: boolean;
@@ -69,6 +70,7 @@ export type HandshakeRequest = {
 };
 
 export type CreateRequest = { type: "create" } & CreateOptions;
+export type CreateOrAttachRequest = { type: "create_or_attach"; session_key: string } & CreateOptions;
 export type ListRequest = { type: "list" };
 export type AttachRequest = { type: "attach"; session: number };
 export type DetachRequest = { type: "detach"; session: number };
@@ -82,6 +84,7 @@ export type ClearScrollbackRequest = { type: "clear_scrollback"; session: number
 export type RequestMessage =
   | HandshakeRequest
   | CreateRequest
+  | CreateOrAttachRequest
   | ListRequest
   | AttachRequest
   | DetachRequest
@@ -271,6 +274,14 @@ export class PtyDaemonClient extends EventEmitter<PtyDaemonClientEvents> {
       const created = await this.create(options, reqOptions);
       return { id: created.session };
     },
+    createOrAttach: async (
+      sessionKey: string,
+      options: CreateOptions = {},
+      reqOptions?: RequestOptions,
+    ): Promise<Session> => {
+      const created = await this.createOrAttach(sessionKey, options, reqOptions);
+      return { id: created.session };
+    },
   };
 
   constructor(options: ClientOptions) {
@@ -368,6 +379,24 @@ export class PtyDaemonClient extends EventEmitter<PtyDaemonClientEvents> {
     return { session: this.requireSession(ok) };
   }
 
+  async createOrAttach(
+    sessionKey: string,
+    options: CreateOptions = {},
+    reqOptions?: RequestOptions,
+  ): Promise<{ session: number }> {
+    const normalizedKey = sessionKey.trim();
+    if (!normalizedKey) {
+      throw new Error("sessionKey must be non-empty");
+    }
+    const ok = this.unwrapOk(
+      await this.requestRaw(
+        { type: "create_or_attach", session_key: normalizedKey, ...options },
+        reqOptions,
+      ),
+    );
+    return { session: this.requireSession(ok) };
+  }
+
   async list(reqOptions?: RequestOptions): Promise<SessionInfo[]> {
     const ok = this.unwrapOk(await this.requestRaw({ type: "list" }, reqOptions));
     return this.requireSessions(ok);
@@ -386,6 +415,15 @@ export class PtyDaemonClient extends EventEmitter<PtyDaemonClientEvents> {
     reqOptions?: RequestOptions,
   ): Promise<{ session: number; snapshot: Snapshot }> {
     const session = await this.session.create(options, reqOptions);
+    return await this.attach(session, reqOptions);
+  }
+
+  async createOrAttachAndAttach(
+    sessionKey: string,
+    options: CreateOptions = {},
+    reqOptions?: RequestOptions,
+  ): Promise<{ session: number; snapshot: Snapshot }> {
+    const session = await this.session.createOrAttach(sessionKey, options, reqOptions);
     return await this.attach(session, reqOptions);
   }
 

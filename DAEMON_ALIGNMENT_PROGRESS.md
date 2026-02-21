@@ -71,7 +71,29 @@
   - Integration/sync test protocol mirrors updated to required fields.
   - Removed old missing-field fallback behavior from handler-level handshake logic.
 
+### 2026-02-21
+
+- Refactored recovery path for new client processes using stable session keys:
+  - Added protocol request `create_or_attach` with `session_key` in `crates/daemon/src/protocol/message.rs`.
+  - Added daemon-side keyed lookup + creation in `crates/daemon/src/session/manager.rs`.
+  - Added session-key index in memory and included `session_key` in `list` session metadata.
+- Extended journal schema for keyed recovery:
+  - Added `session_key` persistence in `crates/daemon/src/session/journal.rs`.
+  - Added journal lookup `latest_entry_for_key` for cold-start keyed recreation defaults.
+- Added SDK surface for keyed workflow restore:
+  - `client.createOrAttach(sessionKey, options)`
+  - `client.createOrAttachAndAttach(sessionKey, options)`
+  - `client.session.createOrAttach(sessionKey, options)`
+  - Updated docs in `packages/pty-daemon/README.md`.
+- Added coverage for new-process restoration scenarios:
+  - Rust: keyed reuse + daemon restart continuity in `crates/daemon/tests/integration_test.rs`.
+  - TS: keyed request path in `packages/pty-daemon/tests/client-create-and-attach.test.ts`.
+- Validation runs:
+  - `cargo test -p vibest-pty-daemon` ✅
+  - `bun test packages/pty-daemon/tests` ✅
+
 ## Next Actions
 
 1. Optional: add journal-focused unit tests (`JournalStore` roundtrip/reconcile edge cases).
 2. Optional: wire explicit daemon metrics export for reconcile outcomes and owner-denied ops.
+3. Optional: add explicit owner-takeover API (`takeover_owner`) for controlled handoff between live clients.

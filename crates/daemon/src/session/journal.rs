@@ -17,11 +17,15 @@ pub enum JournalState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalEntry {
     pub id: u32,
+    #[serde(default)]
+    pub session_key: Option<String>,
     pub pid: i32,
     pub pts: String,
     pub cwd: String,
     pub shell: Option<String>,
+    #[serde(default = "default_cols")]
     pub cols: u16,
+    #[serde(default = "default_rows")]
     pub rows: u16,
     pub state: JournalState,
     pub created_at_secs: u64,
@@ -50,6 +54,7 @@ impl JournalStore {
     pub fn upsert_running(
         &self,
         id: u32,
+        session_key: Option<String>,
         pid: i32,
         pts: String,
         cwd: String,
@@ -64,6 +69,7 @@ impl JournalStore {
             id,
             JournalEntry {
                 id,
+                session_key,
                 pid,
                 pts,
                 cwd,
@@ -123,6 +129,16 @@ impl JournalStore {
             .collect()
     }
 
+    pub fn latest_entry_for_key(&self, session_key: &str) -> Option<JournalEntry> {
+        self.entries
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|entry| entry.session_key.as_deref() == Some(session_key))
+            .max_by_key(|entry| entry.updated_at_secs)
+            .cloned()
+    }
+
     fn load(path: &Path) -> std::io::Result<HashMap<u32, JournalEntry>> {
         if !path.exists() {
             return Ok(HashMap::new());
@@ -172,4 +188,12 @@ pub fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn default_cols() -> u16 {
+    80
+}
+
+fn default_rows() -> u16 {
+    24
 }

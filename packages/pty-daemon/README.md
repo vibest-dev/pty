@@ -109,8 +109,10 @@ type ClientOptions = {
 ## Convenience
 
 - `client.session.create(options)` returns `{ id }` where `id` is the daemon-assigned unique session id.
+- `client.session.createOrAttach(sessionKey, options)` returns a stable `{ id }` by key and can be used by new client processes to reattach workflow sessions.
 - `client.attach({ id })`, `client.write({ id }, data)`, `client.resize({ id }, cols, rows)` use object-first session arguments.
 - `client.createAndAttach(options)` is shorthand for `session.create(options)` then `attach({ id: session.id })`.
+- `client.createOrAttachAndAttach(sessionKey, options)` is shorthand for keyed create-or-attach then attach.
 
 ## Security Notes
 
